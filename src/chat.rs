@@ -9,13 +9,17 @@
 //! streaming (Ollama, LM Studio, OpenRouter, OpenAI). Chat only, no tools;
 //! the current directory listing is sent as a system message for context.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use eframe::egui;
+use egui_phosphor::regular as ph;
 use serde_json::{json, Value};
 
 use crate::attach::{self, Attachment, DragPaths};
@@ -41,6 +45,9 @@ enum Event {
     Text(String),
     Tool(String),
     Error(String),
+    /// Cost/token accounting for the turn that just produced a `result`
+    /// (Claude Code) or an `usage` object (OpenAI-compatible).
+    Usage(TurnUsage),
     Done,
 }
 
@@ -50,6 +57,90 @@ enum Event {
 const MAX_MESSAGES: usize = 400;
 /// User and assistant turns resent as context to an OpenAI-compatible endpoint.
 const MAX_HISTORY_TURNS: usize = 40;
+
+/// Tokens and dollar cost for the last completed turn. Fields are `None`
+/// rather than `0` when the backend didn't report them, so the footer omits
+/// what it doesn't know instead of printing a misleading zero.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TurnUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
+impl TurnUsage {
+    /// Small grey footer text, e.g. `"1.2k in / 340 out · $0.0123"`. `None`
+    /// when nothing was reported at all, so the caller shows nothing rather
+    /// than an empty `·` separator.
+    fn format(&self) -> Option<String> {
+        if self.input_tokens.is_none() && self.output_tokens.is_none() && self.cost_usd.is_none() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.input_tokens.is_some() || self.output_tokens.is_some() {
+            let i = self.input_tokens.map(format_tokens).unwrap_or_else(|| "?".to_string());
+            let o = self.output_tokens.map(format_tokens).unwrap_or_else(|| "?".to_string());
+            parts.push(format!("{i} in / {o} out"));
+        }
+        if let Some(c) = self.cost_usd {
+            parts.push(format_cost(c));
+        }
+        Some(parts.join(" \u{b7} "))
+    }
+}
+
+/// `1234` -> `"1.2k"`, small counts pass through unchanged.
+fn format_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Sub-cent turns are common with small models; show 4 decimal places for
+/// those so they don't all round to "$0.00", and 2 for anything bigger.
+fn format_cost(usd: f64) -> String {
+    if usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// Everything about one working directory's conversation that needs to
+/// survive a folder switch: the transcript, the Claude Code session id (so
+/// `--resume` still targets the right session), and the last user turn (for
+/// the retry button, which needs the original `Attachment`s, not just the
+/// summary text baked into the transcript).
+#[derive(Default)]
+struct DirEntry {
+    messages: Vec<ChatMsg>,
+    session_id: Option<String>,
+    last_turn: Option<(String, Vec<Attachment>)>,
+}
+
+/// Per-directory transcript store. Only ever touched while the panel is
+/// idle: a running turn's directory must never be swapped out from under it
+/// (see `ChatPanel::turn_cwd` and the busy guard in `show`), so the map only
+/// ever holds directories other than the one currently loaded into
+/// `ChatPanel`'s own fields.
+#[derive(Default)]
+struct DirHistory {
+    per_dir: HashMap<PathBuf, DirEntry>,
+}
+
+impl DirHistory {
+    /// Store `outgoing` under `from` (if any directory was active before),
+    /// then remove and return whatever was previously stored for `into`, or
+    /// a fresh empty entry if this is the first visit to that directory.
+    fn swap(&mut self, from: Option<&PathBuf>, outgoing: DirEntry, into: &PathBuf) -> DirEntry {
+        if let Some(from) = from {
+            self.per_dir.insert(from.clone(), outgoing);
+        }
+        self.per_dir.remove(into).unwrap_or_default()
+    }
+}
 
 pub struct ChatPanel {
     pub open: bool,
@@ -69,8 +160,35 @@ pub struct ChatPanel {
     input: String,
     messages: Vec<ChatMsg>,
     session_id: Option<String>,
+    /// Prompt and attachments of the last turn actually sent, kept so the
+    /// retry button can resend exactly what went out, not a reconstruction
+    /// of the summary text shown in the transcript.
+    last_turn: Option<(String, Vec<Attachment>)>,
+    /// Tokens/cost from the last turn's `result` (Claude Code) or `usage`
+    /// (OpenAI-compatible), shown small and grey in the header.
+    last_usage: Option<TurnUsage>,
     busy: bool,
     rx: Option<Receiver<Event>>,
+    /// cwd the in-flight turn was actually sent with. The header shows this
+    /// instead of the explorer's live cwd while busy, since the app's cwd
+    /// can move on if the user navigates mid-turn but the turn keeps
+    /// running where it started.
+    turn_cwd: Option<PathBuf>,
+    /// Backend the in-flight turn is using, captured at send time so Stop
+    /// still targets the right mechanism even if settings change mid-turn.
+    active_backend: Option<Backend>,
+    /// pid of the running Claude Code child, if any. Set by the worker
+    /// thread right after spawn; read by the UI thread on a Stop click.
+    active_pid: Arc<Mutex<Option<u32>>>,
+    /// Cooperative cancellation for the OpenAI-compatible backend: an HTTP
+    /// response body can't be killed like a child process, so the streaming
+    /// loop polls this between lines instead.
+    cancel_flag: Arc<AtomicBool>,
+    /// Per-working-directory transcript store; see `DirHistory`.
+    dir_history: DirHistory,
+    /// Directory whose transcript is currently loaded into `messages` /
+    /// `session_id` / `last_turn` above.
+    current_dir: Option<PathBuf>,
 }
 
 impl ChatPanel {
@@ -87,14 +205,91 @@ impl ChatPanel {
             input: String::new(),
             messages: Vec::new(),
             session_id: None,
+            last_turn: None,
+            last_usage: None,
             busy: false,
             rx: None,
+            turn_cwd: None,
+            active_backend: None,
+            active_pid: Arc::new(Mutex::new(None)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            dir_history: DirHistory::default(),
+            current_dir: None,
         }
     }
 
     pub fn new_session(&mut self) {
         self.session_id = None;
         self.messages.clear();
+        self.last_turn = None;
+        self.last_usage = None;
+    }
+
+    /// Stop the in-flight turn. Clears `rx` immediately so anything the
+    /// worker thread sends afterward (it may take a moment to unwind after
+    /// being killed or seeing the cancel flag) is silently discarded rather
+    /// than appended to a transcript the user already sees as stopped.
+    fn stop(&mut self) {
+        let confirmed = match self.active_backend {
+            Some(Backend::ClaudeCode) => {
+                let pid = self.active_pid.lock().ok().and_then(|mut g| g.take());
+                match pid {
+                    Some(pid) => kill_process_tree(pid),
+                    // Stopped before the worker even recorded a pid: nothing to kill.
+                    None => true,
+                }
+            }
+            Some(Backend::OpenAiCompatible) => {
+                self.cancel_flag.store(true, Ordering::SeqCst);
+                true
+            }
+            None => true,
+        };
+        self.messages.push(ChatMsg {
+            role: if confirmed { Role::Tool } else { Role::Error },
+            text: if confirmed {
+                "stopped by user".to_string()
+            } else {
+                "stop requested, but the process could not be confirmed dead — it may still be running".to_string()
+            },
+        });
+        // Same cleanup as a normal Done: drop the empty assistant placeholder
+        // the streaming reply was writing into.
+        self.messages.retain(|m| !(m.role == Role::Assistant && m.text.is_empty()));
+        self.busy = false;
+        self.rx = None;
+        self.turn_cwd = None;
+        self.active_backend = None;
+    }
+
+    /// If `cwd` differs from the directory whose transcript is currently
+    /// loaded, save the current one and load `cwd`'s. Never called while
+    /// busy: the in-flight turn's directory must stay loaded so its
+    /// streaming reply keeps landing in `messages`.
+    fn sync_dir(&mut self, cwd: &PathBuf) {
+        if self.current_dir.as_ref() == Some(cwd) {
+            return;
+        }
+        let outgoing = DirEntry {
+            messages: std::mem::take(&mut self.messages),
+            session_id: self.session_id.take(),
+            last_turn: self.last_turn.take(),
+        };
+        let incoming = self.dir_history.swap(self.current_dir.as_ref(), outgoing, cwd);
+        self.messages = incoming.messages;
+        self.session_id = incoming.session_id;
+        self.last_turn = incoming.last_turn;
+        self.current_dir = Some(cwd.clone());
+    }
+
+    /// Resend the last turn's exact prompt and attachments as a new turn.
+    fn retry_last(&mut self, cwd: PathBuf, cfg: &Config) {
+        if self.busy {
+            return;
+        }
+        let Some((prompt, atts)) = self.last_turn.clone() else { return };
+        self.attachments = atts;
+        self.send(prompt, cwd, cfg);
     }
 
     /// Add a dropped path as a chip. Refuses non-UTF-8 paths and duplicates,
@@ -129,6 +324,10 @@ impl ChatPanel {
 
         let atts = std::mem::take(&mut self.attachments);
         self.attach_note.clear();
+        // Saved before `atts`/`prompt` are consumed below, so retry can
+        // resend the exact same attachments even though the transcript only
+        // keeps their names.
+        self.last_turn = Some((prompt.clone(), atts.clone()));
         let shown = if atts.is_empty() {
             prompt.clone()
         } else {
@@ -138,6 +337,14 @@ impl ChatPanel {
         self.messages.push(ChatMsg { role: Role::User, text: shown });
         self.messages.push(ChatMsg { role: Role::Assistant, text: String::new() });
         self.busy = true;
+        self.turn_cwd = Some(cwd.clone());
+        self.active_backend = Some(cfg.backend);
+        // Fresh state for this turn: a stale pid or a cancel flag left set
+        // from a previous stop would otherwise misfire on the new one.
+        if let Ok(mut g) = self.active_pid.lock() {
+            *g = None;
+        }
+        self.cancel_flag.store(false, Ordering::SeqCst);
         let (tx, rx) = channel();
         self.rx = Some(rx);
 
@@ -146,6 +353,7 @@ impl ChatPanel {
                 let resume = self.session_id.clone();
                 let mode = cfg.claude_permission_mode.clone();
                 let agent = self.agent.clone();
+                let pid_slot = self.active_pid.clone();
                 // Attachments outside the cwd need --add-dir for the file tools to reach them.
                 let mut add_dirs: Vec<PathBuf> = Vec::new();
                 for a in &atts {
@@ -155,17 +363,18 @@ impl ChatPanel {
                     }
                 }
                 let full = attach::claude_block(&atts, &prompt);
-                thread::spawn(move || run_claude(tx, full, cwd, resume, mode, agent, add_dirs));
+                thread::spawn(move || run_claude(tx, full, cwd, resume, mode, agent, add_dirs, pid_slot));
             }
             Backend::OpenAiCompatible => {
                 let cfg = cfg.clone();
+                let cancel_flag = self.cancel_flag.clone();
                 thread::spawn(move || {
                     // Contents are read here, off the UI thread, at send time.
                     let (full, notices) = attach::openai_block(&atts, &prompt);
                     for n in notices {
                         let _ = tx.send(Event::Tool(format!("attachment: {n}")));
                     }
-                    run_openai(tx, full, cwd, history, cfg)
+                    run_openai(tx, full, cwd, history, cfg, cancel_flag)
                 });
             }
         }
@@ -188,6 +397,7 @@ impl ChatPanel {
                     self.messages.push(ChatMsg { role: Role::Assistant, text: String::new() });
                 }
                 Event::Error(e) => self.messages.push(ChatMsg { role: Role::Error, text: e }),
+                Event::Usage(u) => self.last_usage = Some(u),
                 Event::Done => done = true,
             }
         }
@@ -198,6 +408,8 @@ impl ChatPanel {
         if done {
             self.busy = false;
             self.rx = None;
+            self.turn_cwd = None;
+            self.active_backend = None;
             self.messages.retain(|m| !(m.role == Role::Assistant && m.text.is_empty()));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -207,6 +419,13 @@ impl ChatPanel {
     /// Render as a right side panel. `cwd` is where the next turn runs.
     pub fn show(&mut self, ctx: &egui::Context, cwd: &PathBuf, cfg: &Config) {
         self.poll(ctx);
+        // Keep the per-directory transcript store current even while the
+        // panel is hidden, so reopening it later shows the right history.
+        // Guarded on `!busy`: an in-flight turn's directory must stay loaded
+        // (see `turn_cwd`), not be swapped out because the explorer moved on.
+        if !self.busy {
+            self.sync_dir(cwd);
+        }
         if !self.open {
             return;
         }
@@ -235,7 +454,17 @@ impl ChatPanel {
                     });
                 });
                 ui.horizontal(|ui| {
-                    ui.small(format!("cwd: {}", cwd.display()));
+                    // A running turn keeps working in the directory it was
+                    // sent from; showing the explorer's live cwd instead
+                    // would misreport where the work is happening if the
+                    // user navigated away mid-turn.
+                    let shown_cwd = if self.busy { self.turn_cwd.as_ref().unwrap_or(cwd) } else { cwd };
+                    ui.small(format!("cwd: {}", shown_cwd.display()));
+                    if let Some(usage) = self.last_usage.as_ref().and_then(TurnUsage::format) {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.small(egui::RichText::new(usage).color(ui.visuals().weak_text_color()));
+                        });
+                    }
                 });
                 if cfg.backend == Backend::ClaudeCode && !self.agents.is_empty() {
                     ui.horizontal(|ui| {
@@ -276,19 +505,39 @@ impl ChatPanel {
                 ui.separator();
 
                 let input_h = 90.0;
+                // Only the very last user message gets a retry button, and
+                // only while idle: retrying mid-turn would race the turn
+                // already in flight.
+                let last_user_idx = if self.busy { None } else { self.messages.iter().rposition(|m| m.role == Role::User) };
+                let can_retry = last_user_idx.is_some() && self.last_turn.is_some();
+                let mut retry_clicked = false;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .max_height(ui.available_height() - input_h)
                     .show(ui, |ui| {
-                        for m in &self.messages {
+                        for (i, m) in self.messages.iter().enumerate() {
                             let (label, color) = match m.role {
                                 Role::User => ("You", egui::Color32::LIGHT_BLUE),
                                 Role::Assistant => ("Assistant", egui::Color32::LIGHT_GREEN),
                                 Role::Tool => ("tool", egui::Color32::GRAY),
                                 Role::Error => ("error", egui::Color32::LIGHT_RED),
                             };
-                            ui.label(egui::RichText::new(label).small().color(color));
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).small().color(color));
+                                // Kept off tool lines on purpose: a button on every
+                                // tool-use line would be noise, not a feature.
+                                if m.role == Role::Assistant && !m.text.is_empty() {
+                                    if ui.small_button(ph::COPY).on_hover_text("Copy").clicked() {
+                                        ui.ctx().copy_text(m.text.clone());
+                                    }
+                                }
+                                if can_retry && Some(i) == last_user_idx {
+                                    if ui.small_button(ph::ARROW_CLOCKWISE).on_hover_text("Retry").clicked() {
+                                        retry_clicked = true;
+                                    }
+                                }
+                            });
                             if m.role == Role::Tool {
                                 ui.add(egui::Label::new(egui::RichText::new(&m.text).small().monospace()).wrap());
                             } else {
@@ -297,6 +546,9 @@ impl ChatPanel {
                             ui.add_space(6.0);
                         }
                     });
+                if retry_clicked {
+                    self.retry_last(cwd.clone(), cfg);
+                }
 
                 ui.separator();
                 self.chips(ui, cfg);
@@ -377,8 +629,14 @@ impl ChatPanel {
                 let enter = !picker_took_enter
                     && resp.has_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();
-                if (enter || clicked) && !self.busy && !self.input.trim().is_empty() {
+                // Send doubles as Stop while a turn is running, same button
+                // so there's nothing new to learn: label and action both flip.
+                let clicked = ui.button(if self.busy { "Stop" } else { "Send" }).clicked();
+                if self.busy {
+                    if clicked {
+                        self.stop();
+                    }
+                } else if (enter || clicked) && !self.input.trim().is_empty() {
                     let prompt = self.input.trim_end().to_string();
                     self.input.clear();
                     self.send(prompt, cwd.clone(), cfg);
@@ -467,6 +725,7 @@ fn run_claude(
     mode: String,
     agent: Option<String>,
     add_dirs: Vec<PathBuf>,
+    pid_slot: Arc<Mutex<Option<u32>>>,
 ) {
     let mut cmd = Command::new("claude");
     cmd.current_dir(&cwd)
@@ -499,15 +758,28 @@ fn run_claude(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group (pgid == pid) so Stop can signal the whole tree
+        // — `claude` plus whatever tools it shells out to — with one
+        // negative pid instead of hunting down descendants individually.
+        cmd.process_group(0);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(Event::Error(format!("cannot start claude: {e}")));
+            let _ = tx.send(Event::Error(format!(
+                "Could not start `claude`: {e}. Check the CLI is installed and on PATH, then try Send again."
+            )));
             let _ = tx.send(Event::Done);
             return;
         }
     };
+    if let Ok(mut g) = pid_slot.lock() {
+        *g = Some(child.id());
+    }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let tx_err = tx.clone();
@@ -522,6 +794,10 @@ fn run_claude(
         }
     });
 
+    // Set once a `result` message is actually seen, so a stream that ends
+    // without one (crash, killed process, protocol change) is reported
+    // distinctly instead of silently looking like a normal, quiet turn.
+    let mut saw_result = false;
     for line in BufReader::new(stdout).lines().flatten() {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             // A message worse than the truth, so seeing it is a bug report.
@@ -574,6 +850,13 @@ fn run_claude(
                 }
             }
             "result" => {
+                saw_result = true;
+                let cost = v["total_cost_usd"].as_f64();
+                let input_tokens = v["usage"]["input_tokens"].as_u64();
+                let output_tokens = v["usage"]["output_tokens"].as_u64();
+                if cost.is_some() || input_tokens.is_some() || output_tokens.is_some() {
+                    let _ = tx.send(Event::Usage(TurnUsage { input_tokens, output_tokens, cost_usd: cost }));
+                }
                 if v["is_error"] == true {
                     let msg = v["result"].as_str().unwrap_or("turn failed").to_string();
                     let _ = tx.send(Event::Error(msg));
@@ -582,12 +865,59 @@ fn run_claude(
             _ => {}
         }
     }
+    if !saw_result {
+        let _ = tx.send(Event::Error(
+            "Claude Code exited without finishing the turn (no result message) — it may have crashed or been killed. Check the output above, then try Send again.".to_string(),
+        ));
+    }
     let _ = err_thread.join();
     let _ = child.wait();
+    if let Ok(mut g) = pid_slot.lock() {
+        *g = None;
+    }
     let _ = tx.send(Event::Done);
 }
 
-fn run_openai(tx: Sender<Event>, prompt: String, cwd: PathBuf, mut history: Vec<Value>, cfg: Config) {
+/// Kill a Claude Code child and every descendant, then confirm it is
+/// actually gone rather than trusting the kill call's own exit code —
+/// `taskkill`/`kill` both report success even when the target already
+/// exited or never existed.
+fn kill_process_tree(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // A dead pid makes a second, filtered taskkill print nothing for it
+        // (a live one still shows up in the list); that absence is the
+        // confirmation, not the first call's own exit code.
+        match Command::new("tasklist").args(["/FI", &format!("PID eq {pid}")]).output() {
+            Ok(out) => !String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // `process_group(0)` at spawn made `pid` double as the group id, so
+        // a negative target reaches every descendant, not just the direct
+        // child claude spawned.
+        let _ = Command::new("kill").arg("-TERM").arg(format!("-{pid}")).status();
+        thread::sleep(std::time::Duration::from_millis(120));
+        let _ = Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+        thread::sleep(std::time::Duration::from_millis(80));
+        // `kill -0` on a still-live group succeeds; a fully dead one errors.
+        Command::new("kill")
+            .arg("-0")
+            .arg(format!("-{pid}"))
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn run_openai(tx: Sender<Event>, prompt: String, cwd: PathBuf, mut history: Vec<Value>, cfg: Config, cancel_flag: Arc<AtomicBool>) {
     // Give the model the directory context Claude Code would get from tools.
     let listing: Vec<String> = std::fs::read_dir(&cwd)
         .map(|rd| rd.flatten().take(200).map(|d| d.file_name().to_string_lossy().into_owned()).collect())
@@ -611,18 +941,34 @@ fn run_openai(tx: Sender<Event>, prompt: String, cwd: PathBuf, mut history: Vec<
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             let text = r.into_string().unwrap_or_default();
-            let _ = tx.send(Event::Error(format!("HTTP {code}: {text}")));
+            let _ = tx.send(Event::Error(format!(
+                "Server rejected the request (HTTP {code}). Check the endpoint URL, model name and API key in Settings.\n{text}"
+            )));
             let _ = tx.send(Event::Done);
             return;
         }
         Err(e) => {
-            let _ = tx.send(Event::Error(format!("request failed: {e}")));
+            let _ = tx.send(Event::Error(format!(
+                "Could not reach {url}: {e}. Check the endpoint is running and the base URL in Settings."
+            )));
             let _ = tx.send(Event::Done);
             return;
         }
     };
 
+    // No `saw_done` bookkeeping here: unlike Claude Code's explicit `result`
+    // message, an OpenAI-compatible stream ending after `[DONE]` and one
+    // ending because the connection just dropped both look like "the loop
+    // stopped reading lines" from here, so there is nothing more specific to
+    // report than what's already surfaced via `Event::Error` above or from
+    // an `error` field on the wire.
     for line in BufReader::new(resp.into_reader()).lines().flatten() {
+        // Checked between lines, not just once: an HTTP response body can't
+        // be killed like a child process, so this is the only way Stop can
+        // make the read loop actually stop reading.
+        if cancel_flag.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data.trim() == "[DONE]" {
             break;
@@ -634,6 +980,74 @@ fn run_openai(tx: Sender<Event>, prompt: String, cwd: PathBuf, mut history: Vec<
         if let Some(e) = v["error"]["message"].as_str() {
             let _ = tx.send(Event::Error(e.to_string()));
         }
+        // Only some OpenAI-compatible servers send a trailing `usage`
+        // object (e.g. with `stream_options.include_usage`); when it's
+        // absent we show nothing rather than guess at token counts.
+        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+            let input_tokens = u["prompt_tokens"].as_u64();
+            let output_tokens = u["completion_tokens"].as_u64();
+            if input_tokens.is_some() || output_tokens.is_some() {
+                let _ = tx.send(Event::Usage(TurnUsage { input_tokens, output_tokens, cost_usd: None }));
+            }
+        }
     }
     let _ = tx.send(Event::Done);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_tokens_uses_k_suffix_above_1000() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1.0k");
+        assert_eq!(format_tokens(12_345), "12.3k");
+    }
+
+    #[test]
+    fn format_cost_uses_more_precision_under_a_cent() {
+        assert_eq!(format_cost(0.0031), "$0.0031");
+        assert_eq!(format_cost(0.0099), "$0.0099");
+        assert_eq!(format_cost(0.01), "$0.01");
+        assert_eq!(format_cost(1.5), "$1.50");
+    }
+
+    #[test]
+    fn turn_usage_format_omits_unknown_fields_entirely() {
+        assert_eq!(TurnUsage::default().format(), None);
+        let tokens_only = TurnUsage { input_tokens: Some(100), output_tokens: Some(50), cost_usd: None };
+        assert_eq!(tokens_only.format().as_deref(), Some("100 in / 50 out"));
+        let cost_only = TurnUsage { input_tokens: None, output_tokens: None, cost_usd: Some(0.02) };
+        assert_eq!(cost_only.format().as_deref(), Some("$0.02"));
+        let partial_tokens = TurnUsage { input_tokens: Some(2000), output_tokens: None, cost_usd: Some(0.1234) };
+        assert_eq!(partial_tokens.format().as_deref(), Some("2.0k in / ? out \u{b7} $0.12"));
+    }
+
+    #[test]
+    fn dir_history_swap_roundtrips_messages_and_session_per_directory() {
+        let mut h = DirHistory::default();
+        let dir_a = PathBuf::from("/a");
+        let dir_b = PathBuf::from("/b");
+
+        // First visit to B: nothing stored yet, so it comes back empty.
+        let entry = h.swap(None, DirEntry::default(), &dir_b);
+        assert!(entry.messages.is_empty());
+        assert!(entry.session_id.is_none());
+
+        // Leaving B (still empty) for A, also never visited: still empty.
+        let entry = h.swap(Some(&dir_b), DirEntry::default(), &dir_a);
+        assert!(entry.messages.is_empty());
+
+        // Build up a real conversation in A, then wander off to B and back.
+        let a_messages = vec![ChatMsg { role: Role::User, text: "hi".into() }];
+        let a_entry = DirEntry { messages: a_messages, session_id: Some("sess-a".into()), last_turn: Some(("hi".into(), Vec::new())) };
+        let _ = h.swap(Some(&dir_a), a_entry, &dir_b);
+        let restored = h.swap(Some(&dir_b), DirEntry::default(), &dir_a);
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].text, "hi");
+        assert_eq!(restored.session_id.as_deref(), Some("sess-a"));
+        assert!(restored.last_turn.is_some());
+    }
 }
