@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- A file explorer walks these locations as soon as it opens, and macOS
+       shows the app's own words in the consent prompt. Without them the user
+       sees an unexplained prompt, or the folder simply reads as empty. -->
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>The Real Explorer lists and opens files on your Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>The Real Explorer lists and opens files in your Documents folder.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>The Real Explorer lists and opens files in your Downloads folder.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>The Real Explorer lists files on removable drives you browse to.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>The Real Explorer lists files on network volumes you browse to.</string>
+</dict>
+</plist>

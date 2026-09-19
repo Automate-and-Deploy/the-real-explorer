@@ -31,13 +31,32 @@ use egui_extras::{Column, TableBuilder};
 
 use config::{Backend, Config, ProjectSettings, Theme};
 
+/// Window chrome differs by platform.
+///
+/// Windows and Linux get an undecorated window and the app draws the whole
+/// title bar. macOS keeps its real title bar so the traffic lights, native
+/// drag, edge resize and full screen all work, and hides only its background
+/// and text so the app can draw underneath: an undecorated window there has
+/// no traffic lights at all, and `drag_resize_window` is unsupported, so the
+/// custom resize handles would be dead while still swallowing the pointer.
+fn viewport() -> egui::ViewportBuilder {
+    let b = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([640.0, 400.0])
+        .with_title("The Real Explorer");
+    #[cfg(target_os = "macos")]
+    {
+        b.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        b.with_decorations(false)
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([640.0, 400.0])
-            .with_decorations(false)
-            .with_title("The Real Explorer"),
+        viewport: viewport(),
         ..Default::default()
     };
     eframe::run_native(
@@ -1605,11 +1624,14 @@ fn drive_roots() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut v = vec![PathBuf::from("/")];
+        // Home first: `/` is mostly the read-only system volume and is rarely
+        // what someone opening a file explorer wants to see.
+        let mut v = Vec::new();
         if let Some(h) = dirs::home_dir() {
             v.push(h);
         }
         v.push(PathBuf::from("/Volumes"));
+        v.push(PathBuf::from("/"));
         v
     }
     #[cfg(all(unix, not(target_os = "macos")))]

@@ -21,14 +21,24 @@ if ! cargo packager --version >/dev/null 2>&1; then
   cargo install cargo-packager --locked
 fi
 
+# The dmg step drives Finder over AppleScript to arrange the window, which
+# needs a desktop session and an Automation permission grant. Over SSH it
+# hangs for a minute and fails with -1712, so default to the bundle alone
+# unless the caller asks for the dmg.
 case "$(uname -s)" in
-  Darwin) formats="app,dmg" ;;
+  Darwin) formats="${FORMATS:-app}" ;;
   Linux)  formats="deb,appimage" ;;
   *)      echo "use packaging/package.ps1 on Windows" >&2; exit 1 ;;
 esac
 
 echo "building release binary and packaging: $formats"
+if [ "$(uname -s)" = "Darwin" ] && [ "$formats" = "app" ]; then
+  echo "(set FORMATS=app,dmg from a desktop Terminal to also build the dmg)"
+fi
 cargo packager --release --formats "$formats" --verbose
+
+# create-dmg leaves its read-write intermediate behind when it fails.
+rm -f dist/rw.*.dmg 2>/dev/null || true
 
 echo
 echo "artifacts in dist/:"

@@ -18,13 +18,34 @@ use std::path::{Path, PathBuf};
 
 /// Move `path` to the OS recycle bin / trash.
 ///
-/// Windows: Recycle Bin. macOS: `~/.Trash` via the Finder API. Linux:
-/// freedesktop.org trash spec.
+/// Windows: Recycle Bin. macOS: `~/.Trash` via `NSFileManager`, not Finder,
+/// because the Finder route needs an Automation permission grant and hangs
+/// for a minute without one. Linux: freedesktop.org trash spec.
 ///
 /// Returns `Err` if the path does not exist or the underlying OS call fails
 /// (e.g. permissions, unsupported filesystem).
 pub fn delete_to_trash(path: &Path) -> Result<(), String> {
-    trash::delete(path).map_err(|e| e.to_string())
+    context().delete(path).map_err(|e| e.to_string())
+}
+
+/// A trash context configured for the platform.
+///
+/// macOS needs this: the crate defaults to driving Finder over AppleScript,
+/// which requires an Automation (Apple Events) permission grant. Without one
+/// the call hangs for a minute and then fails with `-1712`, and the file is
+/// still there. `NsFileManager` does the move directly, needs no grant and
+/// works with Finder not running. The cost is no delete sound and no Finder
+/// "Put Back" entry, and this module already documents restore as unsupported
+/// on macOS.
+fn context() -> trash::TrashContext {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx
 }
 
 /// Move several paths to the OS recycle bin / trash in one call.
@@ -35,7 +56,7 @@ pub fn delete_to_trash(path: &Path) -> Result<(), String> {
 /// partial-success information is provided beyond that.
 #[allow(dead_code)]
 pub fn delete_many_to_trash(paths: &[PathBuf]) -> Result<(), String> {
-    trash::delete_all(paths).map_err(|e| e.to_string())
+    context().delete_all(paths).map_err(|e| e.to_string())
 }
 
 /// Human-readable name of the trash destination, for UI text.

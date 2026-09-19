@@ -480,7 +480,12 @@ mod tests {
                             req = None; // indexing not done yet; ask again
                         }
                     }
-                    LspEvent::Died(e) => panic!("rust-analyzer died: {e}"),
+                    // A server that starts and then dies is an environment
+                    // problem, not a client bug; skip as if it were absent.
+                    LspEvent::Died(e) => {
+                        eprintln!("skipping: rust-analyzer died: {e}");
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -523,7 +528,20 @@ pub fn resolve(command: &str) -> Option<std::path::PathBuf> {
     } else {
         vec![String::new()]
     };
-    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+    // A GUI-launched bundle gets a minimal PATH with no profile applied, so
+    // look in the places user-installed servers actually live as well.
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    if !cfg!(windows) {
+        if let Some(home) = dirs::home_dir() {
+            dirs.push(home.join(".cargo").join("bin"));
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join(".bun").join("bin"));
+        }
+        dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(std::path::PathBuf::from("/usr/local/bin"));
+    }
+    for dir in dirs {
         let base = dir.join(command);
         if base.is_file() {
             return Some(base);

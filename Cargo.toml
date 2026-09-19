@@ -46,3 +46,4 @@ depends = ["libgtk-3-0", "libxkbcommon0", "libwayland-client0"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
+info-plist-path = "packaging/macos/Info.partial.plist"

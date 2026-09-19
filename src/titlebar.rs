@@ -27,9 +27,15 @@ pub fn show(ctx: &egui::Context, title: &str) {
             }
 
             ui.horizontal_centered(|ui| {
-                ui.add_space(10.0);
+                // Leave room for the traffic lights, which macOS draws itself.
+                ui.add_space(if cfg!(target_os = "macos") { 78.0 } else { 10.0 });
                 ui.label(egui::RichText::new(icons::IDE).color(ui.visuals().selection.stroke.color));
                 ui.label(egui::RichText::new(title).strong());
+                // macOS supplies close, minimise and zoom on the left; drawing
+                // our own on the right would be a second, wrong set.
+                if cfg!(target_os = "macos") {
+                    return;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let danger = egui::Color32::from_rgb(0xf7, 0x76, 0x8e);
@@ -74,6 +80,12 @@ fn window_button(ui: &mut egui::Ui, glyph: &str, hover: Option<egui::Color32>) -
 /// Resize handles on the window edges. Call once per frame after all panels
 /// so the handles sit on top. No-op when the window is maximised.
 pub fn resize_handles(ctx: &egui::Context) {
+    // `ViewportCommand::BeginResize` reaches `drag_resize_window`, which macOS
+    // does not implement; the handles would do nothing except take the pointer
+    // away from the native edge resize the real title bar provides.
+    if cfg!(target_os = "macos") {
+        return;
+    }
     if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
         return;
     }

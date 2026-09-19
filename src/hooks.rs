@@ -468,8 +468,11 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<std::process::Child
 
 #[cfg(not(windows))]
 fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<std::process::Child> {
+    // `-l`: an app launched from Finder or the Dock inherits a bare PATH
+    // (/usr/bin:/bin:/usr/sbin:/sbin) and no profile, so a hook that lives in
+    // ~/.cargo/bin or /opt/homebrew/bin is otherwise unreachable.
     ProcCommand::new("sh")
-        .arg("-c")
+        .arg("-lc")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::piped())
