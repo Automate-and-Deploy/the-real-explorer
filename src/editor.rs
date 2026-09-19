@@ -106,7 +106,10 @@ impl Editor {
                     }
                     Err(e) => {
                         self.failed.insert(def.command.clone(), e.clone());
-                        self.status = format!("No language server: {e}");
+                        self.status = format!(
+                            "No language server for .{ext}: '{}' is not installed or not on PATH (Settings > Language servers)",
+                            def.command
+                        );
                     }
                 }
             }
@@ -134,7 +137,35 @@ impl Editor {
         self.completion = None;
     }
 
-    pub fn save_active(&mut self) {
+    /// Pretty-print the active document if it is JSON. Returns Err with the
+    /// parse error when the text is not valid JSON, leaving it untouched.
+    pub fn format_active(&mut self) -> Result<(), String> {
+        let Some(d) = self.docs.get_mut(self.active) else { return Ok(()) };
+        if !is_json(&d.path) {
+            return Err("Format: only JSON is supported so far".into());
+        }
+        let v: serde_json::Value = serde_json::from_str(&d.text).map_err(|e| e.to_string())?;
+        let mut out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        out.push('\n');
+        if out != d.text {
+            d.text = out.clone();
+            d.last_text = out;
+            d.dirty = true;
+            d.version += 1;
+            let (path, version, text) = (d.path.clone(), d.version, d.text.clone());
+            if let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) {
+                c.did_change(&path, version, &text);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_active(&mut self, format_json: bool) {
+        if format_json && self.docs.get(self.active).map(|d| is_json(&d.path)).unwrap_or(false) {
+            if let Err(e) = self.format_active() {
+                self.status = format!("Saved without formatting: {e}");
+            }
+        }
         let Some(d) = self.docs.get_mut(self.active) else { return };
         match fs::write(&d.path, &d.text) {
             Ok(()) => {
@@ -237,7 +268,7 @@ impl Editor {
         self.cursor_char = new_cursor;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, servers: &[ServerDef]) {
+    pub fn show(&mut self, ui: &mut egui::Ui, servers: &[ServerDef], format_json_on_save: bool) {
         let _ = servers;
         self.poll_servers();
         let ctx = ui.ctx().clone();
@@ -271,6 +302,7 @@ impl Editor {
         let mut accept = false;
         let mut ctrl_space = false;
         let mut save = false;
+        let mut format = false;
         let mut hover_req = false;
         ui.input_mut(|i| {
             if self.completion.is_some() {
@@ -294,6 +326,9 @@ impl Editor {
             if i.consume_key(Modifiers::COMMAND, Key::Space) {
                 ctrl_space = true;
             }
+            if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F) {
+                format = true;
+            }
             if i.consume_key(Modifiers::COMMAND, Key::S) {
                 save = true;
             }
@@ -306,8 +341,14 @@ impl Editor {
         if accept {
             self.accept_completion(&ctx, edit_id);
         }
+        if format {
+            match self.format_active() {
+                Ok(()) => self.status = "Formatted".into(),
+                Err(e) => self.status = e,
+            }
+        }
         if save {
-            self.save_active();
+            self.save_active(format_json_on_save);
         }
 
         // ---- editor body ----
@@ -360,6 +401,12 @@ impl Editor {
                     d.last_text = d.text.clone();
                 }
             });
+
+        // Built-in JSON check for documents with no language server.
+        if (text_changed || self.docs[active].version == 0) && self.docs[active].server.is_none() && is_json(&self.docs[active].path) {
+            let d = &mut self.docs[active];
+            d.diagnostics = json_diagnostics(&d.text);
+        }
 
         // ---- sync + completion triggers ----
         if text_changed {
@@ -618,5 +665,47 @@ fn kind_glyph(kind: u32) -> &'static str {
         15 => "✂",     // snippet
         21 => "π",     // constant
         _ => "·",
+    }
+}
+
+fn is_json(path: &Path) -> bool {
+    matches!(
+        path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(),
+        Some("json") | Some("jsonc")
+    )
+}
+
+/// Built-in JSON syntax check used when no language server handles .json.
+fn json_diagnostics(text: &str) -> Vec<Diagnostic> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            let line = (e.line().max(1) - 1) as u32;
+            let col = (e.column().max(1) - 1) as u32;
+            vec![Diagnostic { line, col_start: col, line_end: line, col_end: col + 1, severity: 1, message: e.to_string() }]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_diagnostics_flags_trailing_comma_at_right_spot() {
+        let d = json_diagnostics("{\n  \"a\": 1,,\n}");
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].line, d[0].col_start), (1, 9));
+        assert!(!d[0].message.is_empty());
+        assert!(json_diagnostics("{\"ok\": [1, 2]}").is_empty());
+    }
+
+    #[test]
+    fn pretty_print_round_trips_and_ends_with_newline() {
+        let v: serde_json::Value = serde_json::from_str("{\"b\":[1,{\"c\":true}],\"a\":\"x\"}").unwrap();
+        let mut out = serde_json::to_string_pretty(&v).unwrap();
+        out.push('\n');
+        assert!(out.starts_with("{\n  \"a\": \"x\""));
+        assert!(out.ends_with("}\n"));
     }
 }

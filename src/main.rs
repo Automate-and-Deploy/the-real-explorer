@@ -549,6 +549,14 @@ impl ExplorerApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.body == Body::Ide, egui::Button::new("Format document	Ctrl+Shift+F")).clicked() {
+                    match self.editor.format_active() {
+                        Ok(()) => self.status = "Formatted".into(),
+                        Err(e) => self.status = e,
+                    }
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.add_enabled(self.undo.is_some(), egui::Button::new(self.undo_label())).clicked() {
                     self.undo();
                     ui.close_menu();
@@ -1213,6 +1221,7 @@ impl ExplorerApp {
                         changed = true;
                     }
                 });
+                changed |= ui.checkbox(&mut self.cfg.format_json_on_save, "Format JSON on save").changed();
                 ui.add_space(8.0);
                 ui.heading("Appearance");
                 ui.horizontal(|ui| {
@@ -1349,7 +1358,7 @@ impl eframe::App for ExplorerApp {
                 Body::Explorer => self.details_panel(ui),
                 Body::Ide => {
                     let servers = self.cfg.lsp_servers.clone();
-                    self.editor.show(ui, &servers);
+                    self.editor.show(ui, &servers, self.cfg.format_json_on_save);
                     if !self.editor.status.is_empty() {
                         self.status = std::mem::take(&mut self.editor.status);
                     }

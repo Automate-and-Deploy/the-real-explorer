@@ -36,6 +36,12 @@ pub struct Config {
     pub chat_open: bool,
     #[serde(default = "crate::lsp::default_servers")]
     pub lsp_servers: Vec<crate::lsp::ServerDef>,
+    #[serde(default = "default_true")]
+    pub format_json_on_save: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -50,6 +56,7 @@ impl Default for Config {
             show_hidden: false,
             chat_open: true,
             lsp_servers: crate::lsp::default_servers(),
+            format_json_on_save: true,
         }
     }
 }
