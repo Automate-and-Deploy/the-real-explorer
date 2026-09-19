@@ -13,6 +13,7 @@ mod icons;
 mod lsp;
 mod platform;
 mod theme;
+mod titlebar;
 mod trash_ops;
 
 use std::collections::{BTreeSet, HashMap};
@@ -29,7 +30,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_decorations(false)
+            .with_title("Rust Explorer"),
         ..Default::default()
     };
     eframe::run_native(
@@ -109,6 +112,8 @@ struct ExplorerApp {
     /// Tree state: which directories are expanded, and cached children per dir.
     expanded: BTreeSet<PathBuf>,
     tree_children: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Files per directory, shown in the tree only while the IDE tab is active.
+    tree_files: HashMap<PathBuf, Vec<PathBuf>>,
     roots: Vec<PathBuf>,
     show_tree: bool,
     status: String,
@@ -145,6 +150,7 @@ impl ExplorerApp {
             sort_asc: true,
             expanded: BTreeSet::new(),
             tree_children: HashMap::new(),
+            tree_files: HashMap::new(),
             roots: drive_roots(),
             show_tree: true,
             status: String::new(),
@@ -243,6 +249,7 @@ impl ExplorerApp {
     /// Reload the list and drop the tree cache so new or renamed folders show.
     fn refresh_all(&mut self) {
         self.tree_children.clear();
+        self.tree_files.clear();
         self.reload();
     }
 
@@ -317,6 +324,29 @@ impl ExplorerApp {
         kids.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
         self.tree_children.insert(dir.to_path_buf(), kids.clone());
         kids
+    }
+
+    /// Files directly inside `dir`, cached; used by the tree in IDE mode.
+    fn tree_files(&mut self, dir: &Path) -> Vec<PathBuf> {
+        if let Some(c) = self.tree_files.get(dir) {
+            return c.clone();
+        }
+        let show_hidden = self.cfg.show_hidden;
+        let mut files: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|de| de.file_type().map(|t| !t.is_dir()).unwrap_or(false))
+                    .map(|de| de.path())
+                    .filter(|p| {
+                        show_hidden
+                            || !is_hidden(&p.file_name().unwrap_or_default().to_string_lossy(), p)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        self.tree_files.insert(dir.to_path_buf(), files.clone());
+        files
     }
 
     fn open_entry(&mut self, e: &Entry) {
@@ -681,6 +711,26 @@ impl ExplorerApp {
         if is_open {
             for child in self.tree_children(dir) {
                 self.tree_node(ui, &child, depth + 1);
+            }
+            if self.body == Body::Ide {
+                let open_path = self.editor.docs.get(self.editor.active).map(|d| d.path.clone());
+                for file in self.tree_files(dir) {
+                    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let (glyph, color) = icons::file(&name);
+                    let color = icons::tint(color, ui.visuals().dark_mode);
+                    let is_active = open_path.as_ref() == Some(&file);
+                    ui.horizontal(|ui| {
+                        ui.add_space((depth + 1) as f32 * 14.0 + 16.0);
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+                        let name_color = if is_active { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
+                        job.append(&name, 0.0, egui::TextFormat { font_id: font, color: name_color, ..Default::default() });
+                        if ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate()).clicked() {
+                            self.open_in_ide(&file);
+                        }
+                    });
+                }
             }
         }
     }
@@ -1256,6 +1306,7 @@ impl eframe::App for ExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
 
+        titlebar::show(ctx, "Rust Explorer");
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ctx, ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1309,6 +1360,7 @@ impl eframe::App for ExplorerApp {
         self.modal_window(ctx);
         self.settings_window(ctx);
         self.properties_window(ctx);
+        titlebar::resize_handles(ctx);
     }
 }
 
