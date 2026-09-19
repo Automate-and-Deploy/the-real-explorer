@@ -73,6 +73,12 @@ with no elevation, macOS an app bundle and a dmg, Linux a deb and an AppImage.
 | Delete to trash            | Recycle Bin, restorable | `~/.Trash`                           | freedesktop trash, restorable |
 | Drag a file to another app | yes                     | yes                                  | not supported                 |
 
+On macOS, Cmd+Q and the Quit menu item bypass the unsaved-changes guard and
+end the process immediately. They call the application terminate path, which
+the windowing layer does not intercept, so no event reaches the app. Use the
+window's close button, which does prompt. Fixing this needs an application
+delegate at the AppKit level rather than a change in this code.
+
 Windows is the development platform. macOS was tested on an Apple silicon Mac
 mini and Linux on Ubuntu 24.04, both including the installers.
 

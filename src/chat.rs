@@ -901,19 +901,63 @@ fn kill_process_tree(pid: u32) -> bool {
     #[cfg(not(windows))]
     {
         // `process_group(0)` at spawn made `pid` double as the group id, so
-        // a negative target reaches every descendant, not just the direct
-        // child claude spawned.
-        let _ = Command::new("kill").arg("-TERM").arg(format!("-{pid}")).status();
+        // a negative target *should* reach every descendant with one signal.
+        // It does not: verified on macOS 26.2 with a real `claude` turn that
+        // a Bash tool call spawns its shell in a *different*, new process
+        // group (Node's `child_process.spawn(..., { detached: true })`),
+        // still parented under `claude` but invisible to a group-wide
+        // signal. `kill -TERM -<pid>` / `kill -KILL -<pid>` killed `claude`
+        // itself while the Bash-tool subprocess (and everything under it)
+        // kept running, reparented to launchd, and the old `kill -0 -<pid>`
+        // check still reported "confirmed dead" because a zombie and a gone
+        // group both make `kill -0` fail the same way, so it cannot tell
+        // them apart from here. Fix: walk the real PPID tree via `pgrep -P`
+        // (catches a detached descendant the group signal misses) in
+        // addition to the group, and confirm every collected pid by itself.
+        let mut pids = vec![pid];
+        let mut frontier = vec![pid];
+        while let Some(p) = frontier.pop() {
+            let Ok(out) = Command::new("pgrep").arg("-P").arg(p.to_string()).output() else { continue };
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(child) = line.trim().parse::<u32>() {
+                    if !pids.contains(&child) {
+                        pids.push(child);
+                        frontier.push(child);
+                    }
+                }
+            }
+        }
+        let signal = |sig: &str, pids: &[u32]| {
+            let _ = Command::new("kill").arg(sig).arg(format!("-{pid}")).status();
+            for p in pids {
+                let _ = Command::new("kill").arg(sig).arg(p.to_string()).status();
+            }
+        };
+        signal("-TERM", &pids);
         thread::sleep(std::time::Duration::from_millis(120));
-        let _ = Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+        signal("-KILL", &pids);
         thread::sleep(std::time::Duration::from_millis(80));
-        // `kill -0` on a still-live group succeeds; a fully dead one errors.
-        Command::new("kill")
-            .arg("-0")
-            .arg(format!("-{pid}"))
-            .status()
-            .map(|s| !s.success())
-            .unwrap_or(false)
+        // Confirmation is not `kill -0` on each plain pid: a zombie's pid
+        // slot still exists, so a *plain* (non-group) `kill -0` on it
+        // succeeds — measured directly against `claude`'s own pid here,
+        // which reported alive by that check moments after being reaped
+        // with SIGKILL. `kill -0` on the *group* form (`-pid`) does fail for
+        // a lone zombie on macOS (EPERM), which is what the previous
+        // single-pid version of this check relied on — but that shortcut
+        // does not extend to the individually-collected descendant pids
+        // above, which are plain pids, not groups. Read `ps` state instead:
+        // empty (gone) or `Z` (zombie, terminated but unreaped by its
+        // parent — inert either way) both count as dead.
+        pids.iter().all(|p| {
+            match Command::new("ps").arg("-o").arg("stat=").arg("-p").arg(p.to_string()).output() {
+                Ok(out) if out.status.success() => {
+                    let stat = String::from_utf8_lossy(&out.stdout);
+                    let stat = stat.trim();
+                    stat.is_empty() || stat.starts_with('Z')
+                }
+                _ => true,
+            }
+        })
     }
 }
 
@@ -1049,5 +1093,72 @@ mod tests {
         assert_eq!(restored.messages[0].text, "hi");
         assert_eq!(restored.session_id.as_deref(), Some("sess-a"));
         assert!(restored.last_turn.is_some());
+    }
+
+    /// Regression for the macOS bug where `kill_process_tree` reported a
+    /// turn dead while a Bash-tool subprocess kept running: Claude Code
+    /// (like many Node CLIs) spawns tool subprocesses with
+    /// `child_process.spawn(..., { detached: true })`, landing them in a
+    /// *new* process group invisible to a plain `-<pid>` group signal, even
+    /// though they are still real descendants. `set -m` (job control) makes
+    /// a plain `sh -c` script background a job into its own new group the
+    /// same way, so this reproduces the failure mode without needing a real
+    /// `claude` invocation, an API key, or network access.
+    #[cfg(not(windows))]
+    #[test]
+    fn kill_process_tree_reaches_a_detached_descendant() {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("set -m; sleep 300 & echo GRANDCHILD_PID=$!; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn should succeed");
+        let pid = child.id();
+
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let grandchild: u32 = line
+            .trim()
+            .strip_prefix("GRANDCHILD_PID=")
+            .expect("child should report its own grandchild's pid")
+            .parse()
+            .unwrap();
+
+        // Sanity check the repro actually landed the grandchild in a
+        // different group than `pid` -- otherwise this test would pass
+        // even without the fix, for the wrong reason.
+        let pgid_of = |p: u32| {
+            Command::new("ps").arg("-o").arg("pgid=").arg("-p").arg(p.to_string()).output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        assert_ne!(
+            pgid_of(pid),
+            pgid_of(grandchild),
+            "test setup should put the grandchild in its own process group"
+        );
+
+        assert!(kill_process_tree(pid), "kill_process_tree should confirm the tree is dead");
+
+        let grandchild_state = Command::new("ps")
+            .arg("-o")
+            .arg("stat=")
+            .arg("-p")
+            .arg(grandchild.to_string())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert!(
+            grandchild_state.is_empty() || grandchild_state.starts_with('Z'),
+            "detached grandchild pid {grandchild} should be dead too, ps stat was {grandchild_state:?}"
+        );
+
+        let _ = child.wait();
     }
 }
