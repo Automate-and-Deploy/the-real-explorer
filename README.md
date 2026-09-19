@@ -11,7 +11,8 @@ binary with no web view.
 **Explorer.** A folder tree on the left over every drive, a sortable details
 list in the middle, and the Windows Explorer operations you expect: copy, cut,
 paste, rename, new folder, new file, properties, open a terminal here. Deleting
-goes to the Recycle Bin and Ctrl+Z brings it back. Right-click menus mirror the
+goes to the recycle bin, and Ctrl+Z brings it back on Windows and Linux;
+macOS has no restore API, so there it is a one-way trip to the Trash. Right-click menus mirror the
 Windows 11 layout, including View, Sort by and Group by.
 
 **Editor with language servers.** The centre panel switches to an IDE tab with

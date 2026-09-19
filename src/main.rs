@@ -932,6 +932,7 @@ impl ExplorerApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                ui.small("Text editing undo is Ctrl+Z inside the editor.");
                 if ui.add_enabled(self.body == Body::Ide, egui::Button::new("Format document	Ctrl+Shift+F")).clicked() {
                     match self.editor.format_active() {
                         Ok(()) => self.status = "Formatted".into(),
@@ -1802,7 +1803,7 @@ impl ExplorerApp {
                 }
                 ui.add_space(8.0);
                 ui.heading("Language servers");
-                ui.small("Command per file type. Servers start on first open; missing binaries are reported in the status bar.");
+                ui.small("Extensions, command, and the language id sent in didOpen. Servers start on first open.");
                 let mut remove: Option<usize> = None;
                 // Plain rows with explicit sizes rather than a Grid: a Grid cell
                 // clamps a TextEdit to the column width it measured last frame, so
@@ -1821,6 +1822,9 @@ impl ExplorerApp {
                             let mut parts = cmdline.split_whitespace();
                             srv.command = parts.next().unwrap_or("").to_string();
                             srv.args = parts.map(|a| a.to_string()).collect();
+                            changed = true;
+                        }
+                        if ui.add_sized([90.0, 20.0], egui::TextEdit::singleline(&mut srv.language_id)).changed() {
                             changed = true;
                         }
                         if found {
