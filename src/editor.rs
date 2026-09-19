@@ -46,6 +46,12 @@ pub struct Editor {
     cursor_char: usize,
     /// True when a file was opened this frame: focus the editor and reset cursor.
     focus_next: bool,
+    /// Missing-server note, shown quietly under the tab strip instead of in
+    /// the status bar, which the explorer shares for item counts.
+    lsp_note: Option<String>,
+    /// Render markdown instead of editing it.
+    preview: bool,
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl Editor {
@@ -61,6 +67,9 @@ impl Editor {
             status: String::new(),
             cursor_char: 0,
             focus_next: false,
+            lsp_note: None,
+            preview: false,
+            md_cache: egui_commonmark::CommonMarkCache::default(),
         }
     }
 
@@ -99,6 +108,12 @@ impl Editor {
         if let Some(def) = def {
             let project_root = find_project_root(path, &def).unwrap_or_else(|| root.to_path_buf());
             if !self.servers.contains_key(&def.command) && !self.failed.contains_key(&def.command) {
+                // A server that is simply not installed is not news: the editor
+                // works without it and Settings lists what is missing. Only a
+                // binary that exists and then fails to start is worth saying.
+                if lsp::resolve(&def.command).is_none() {
+                    self.failed.insert(def.command.clone(), format!("{} not installed", def.command));
+                } else {
                 match LspClient::start(&def, &project_root) {
                     Ok(c) => {
                         self.servers.insert(def.command.clone(), c);
@@ -106,11 +121,9 @@ impl Editor {
                     }
                     Err(e) => {
                         self.failed.insert(def.command.clone(), e.clone());
-                        self.status = format!(
-                            "No language server for .{ext}: '{}' is not installed or not on PATH (Settings > Language servers)",
-                            def.command
-                        );
+                        self.lsp_note = Some(format!("{} failed to start: {e}", def.command));
                     }
+                }
                 }
             }
             if let Some(c) = self.servers.get_mut(&def.command) {
@@ -296,7 +309,46 @@ impl Editor {
             ui.centered_and_justified(|ui| ui.label("Open a file from the Explorer tab"));
             return;
         }
+
+        // ---- preview toggle and quiet notes ----
+        let kind = preview_kind(&self.docs[self.active].path);
+        ui.horizontal(|ui| {
+            match kind {
+                PreviewKind::Markdown => {
+                    ui.selectable_value(&mut self.preview, false, "Source");
+                    ui.selectable_value(&mut self.preview, true, "Preview");
+                }
+                PreviewKind::Html => {
+                    // No web view is embedded, so an honest preview is the browser.
+                    if ui.button("Open preview in browser").clicked() {
+                        let p = self.docs[self.active].path.clone();
+                        if self.docs[self.active].dirty {
+                            self.status = "Save first: the browser reads the file on disk".into();
+                        } else if let Err(e) = open::that_detached(&p) {
+                            self.status = format!("Preview failed: {e}");
+                        }
+                    }
+                }
+                PreviewKind::None => {}
+            }
+            if let Some(note) = &self.lsp_note {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(egui::RichText::new(note).weak());
+                });
+            }
+        });
         ui.separator();
+
+        if self.preview && kind == PreviewKind::Markdown {
+            let text = self.docs[self.active].text.clone();
+            egui::ScrollArea::vertical()
+                .id_salt(("md-preview", self.active))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md_cache, &text);
+                });
+            return;
+        }
 
         // ---- keys the popup owns, consumed before the widget sees them ----
         let mut accept = false;
@@ -708,5 +760,21 @@ mod tests {
         // preserve_order keeps the file's own key order; formatting must not reorder keys.
         assert!(out.starts_with("{\n  \"b\": ["), "{out}");
         assert!(out.ends_with("}\n"));
+    }
+}
+
+/// What the Preview control offers for a given file.
+#[derive(Clone, Copy, PartialEq)]
+enum PreviewKind {
+    Markdown,
+    Html,
+    None,
+}
+
+fn preview_kind(path: &Path) -> PreviewKind {
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+        Some("md") | Some("mdx") | Some("markdown") => PreviewKind::Markdown,
+        Some("html") | Some("htm") => PreviewKind::Html,
+        _ => PreviewKind::None,
     }
 }

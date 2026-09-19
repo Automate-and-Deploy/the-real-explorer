@@ -77,6 +77,9 @@ impl HarnessWindow {
         }
     }
 
+    /// Render as a separate native window (egui viewport). The immediate
+    /// viewport runs inside the parent's frame, so actions come back the same
+    /// way as before. Closing the OS window sets `open` false.
     pub fn show(&mut self, ctx: &egui::Context, project: &Path) -> Vec<Action> {
         let mut actions = Vec::new();
         if !self.open {
@@ -85,36 +88,49 @@ impl HarnessWindow {
         if self.catalog.is_none() {
             actions.push(Action::Refresh);
         }
-        let mut open = self.open;
-        egui::Window::new("Agents, skills and hooks")
-            .open(&mut open)
-            .default_width(900.0)
-            .default_height(520.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Agents, "Agents");
-                    ui.selectable_value(&mut self.tab, Tab::Skills, "Skills");
-                    ui.selectable_value(&mut self.tab, Tab::Hooks, "Hooks");
-                    ui.separator();
-                    ui.label("Scope");
-                    ui.selectable_value(&mut self.filter, Filter::Both, "Both");
-                    ui.selectable_value(&mut self.filter, Filter::Project, "Project");
-                    ui.selectable_value(&mut self.filter, Filter::User, "User");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(format!("{} Refresh", icons::REFRESH)).clicked() {
-                            actions.push(Action::Refresh);
-                        }
-                    });
-                });
-                ui.separator();
-                match self.tab {
-                    Tab::Agents | Tab::Skills => self.items_tab(ui, project, &mut actions),
-                    Tab::Hooks => self.hooks_tab(ui, project, &mut actions),
+        let id = egui::ViewportId::from_hash_of("harness-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Agents, skills and hooks")
+            .with_inner_size([960.0, 620.0])
+            .with_min_inner_size([640.0, 400.0])
+            .with_decorations(false);
+        ctx.show_viewport_immediate(id, builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                // Backend cannot open native windows; fall back to an in-app window.
+                egui::Window::new("Agents, skills and hooks").show(ctx, |ui| self.body(ui, project, &mut actions));
+                return;
+            }
+            crate::titlebar::show(ctx, "Agents, skills and hooks");
+            egui::CentralPanel::default().show(ctx, |ui| self.body(ui, project, &mut actions));
+            crate::titlebar::resize_handles(ctx);
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.open = false;
+            }
+        });
+        actions
+    }
+
+    fn body(&mut self, ui: &mut egui::Ui, project: &Path, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Agents, "Agents");
+            ui.selectable_value(&mut self.tab, Tab::Skills, "Skills");
+            ui.selectable_value(&mut self.tab, Tab::Hooks, "Hooks");
+            ui.separator();
+            ui.label("Scope");
+            ui.selectable_value(&mut self.filter, Filter::Both, "Both");
+            ui.selectable_value(&mut self.filter, Filter::Project, "Project");
+            ui.selectable_value(&mut self.filter, Filter::User, "User");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(format!("{} Refresh", icons::REFRESH)).clicked() {
+                    actions.push(Action::Refresh);
                 }
             });
-        self.open = open;
-        actions
+        });
+        ui.separator();
+        match self.tab {
+            Tab::Agents | Tab::Skills => self.items_tab(ui, project, actions),
+            Tab::Hooks => self.hooks_tab(ui, project, actions),
+        }
     }
 
     fn items_tab(&mut self, ui: &mut egui::Ui, project: &Path, actions: &mut Vec<Action>) {

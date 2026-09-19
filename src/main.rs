@@ -29,7 +29,7 @@ use std::time::SystemTime;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use config::{Backend, Config, Theme};
+use config::{Backend, Config, ProjectSettings, Theme};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -139,6 +139,12 @@ struct ExplorerApp {
     body: Body,
     editor: editor::Editor,
     harness: harness_ui::HarnessWindow,
+    /// True once an in-app drag has been handed to the OS this gesture, so the
+    /// hand-off happens once per drag rather than every frame.
+    os_drag_handed_off: bool,
+    /// Theme asked for by a project's `.code/settings.json`, applied on the
+    /// next frame because loading happens where there is no egui context.
+    pending_theme: Option<Theme>,
 }
 
 impl ExplorerApp {
@@ -173,11 +179,27 @@ impl ExplorerApp {
             body: Body::Explorer,
             editor: editor::Editor::new(),
             harness: harness_ui::HarnessWindow::new(),
+            os_drag_handed_off: false,
+            pending_theme: None,
         };
         app.reload();
         app.expand_ancestors(&start);
         app.refresh_harness();
+        app.apply_project_settings();
         app
+    }
+
+    /// Read `<cwd>/.code/settings.json`, if present, over the global settings.
+    /// The file is authoritative for the keys it names and silent about the rest.
+    fn apply_project_settings(&mut self) {
+        let Some(ps) = ProjectSettings::load(&self.cwd) else { return };
+        let before = self.cfg.theme;
+        ps.apply_to(&mut self.cfg);
+        if self.cfg.theme != before {
+            self.pending_theme = Some(self.cfg.theme);
+        }
+        self.status = format!("Applied {}", ProjectSettings::path(&self.cwd).display());
+        self.reload();
     }
 
     /// Rescan agents and skills for the current folder and push the snapshot
@@ -221,6 +243,7 @@ impl ExplorerApp {
         self.selected = None;
         self.reload();
         self.refresh_harness();
+        self.apply_project_settings();
         let cwd = self.cwd.clone();
         self.expand_ancestors(&cwd);
     }
@@ -568,6 +591,13 @@ impl ExplorerApp {
                     self.open_terminal();
                     ui.close_menu();
                 }
+                if ui.button("Save project settings (.code)").clicked() {
+                    match ProjectSettings::save(&self.cwd, &self.cfg) {
+                        Ok(p) => self.status = format!("Wrote {}", p.display()),
+                        Err(e) => self.status = format!("Failed: {e}"),
+                    }
+                    ui.close_menu();
+                }
                 if ui.button("Settings\tCtrl+,").clicked() {
                     self.settings_open = true;
                     ui.close_menu();
@@ -664,6 +694,36 @@ impl ExplorerApp {
                     ui.close_menu();
                 }
             });
+            ui.menu_button("Agents", |ui| {
+                if ui.button("Open agents window").clicked() {
+                    self.harness.open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Refresh catalog").clicked() {
+                    self.refresh_harness();
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Assistant agent").small());
+                if ui.radio(self.chat.agent.is_none(), "(default)").clicked() {
+                    self.chat.agent = None;
+                    self.chat.new_session();
+                    ui.close_menu();
+                }
+                // Snapshot first: the loop needs &self.chat.agents while assigning to it.
+                let agents: Vec<(String, &'static str)> =
+                    self.chat.agents.iter().map(|(n, b, _)| (n.clone(), *b)).collect();
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    for (name, badge) in agents {
+                        let on = self.chat.agent.as_deref() == Some(name.as_str());
+                        if ui.radio(on, format!("{badge} {name}")).clicked() {
+                            self.chat.agent = Some(name);
+                            self.chat.new_session();
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
         });
     }
 
@@ -747,8 +807,8 @@ impl ExplorerApp {
             job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
             let name_color = if is_cwd { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
             job.append(&label, 0.0, egui::TextFormat { font_id: font, color: name_color, ..Default::default() });
-            let resp = ui.add(egui::Label::new(job).sense(egui::Sense::click_and_drag()).truncate());
-            resp.dnd_set_drag_payload(attach::DragPaths(vec![dir.to_path_buf()]));
+            let resp = ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate());
+            attach::drag_source(&resp, || vec![dir.to_path_buf()]);
             if resp.clicked() {
                 self.expanded.insert(dir.to_path_buf());
                 self.navigate(dir.to_path_buf());
@@ -773,8 +833,8 @@ impl ExplorerApp {
                         job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
                         let name_color = if is_active { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
                         job.append(&name, 0.0, egui::TextFormat { font_id: font, color: name_color, ..Default::default() });
-                        let r = ui.add(egui::Label::new(job).sense(egui::Sense::click_and_drag()).truncate());
-                        r.dnd_set_drag_payload(attach::DragPaths(vec![file.clone()]));
+                        let r = ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate());
+                        attach::drag_source(&r, || vec![file.clone()]);
                         if r.clicked() {
                             self.open_in_ide(&file);
                         }
@@ -1230,19 +1290,25 @@ impl ExplorerApp {
                 ui.heading("Language servers");
                 ui.small("Command per file type. Servers start on first open; missing binaries are reported in the status bar.");
                 let mut remove: Option<usize> = None;
-                egui::Grid::new("lsp").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                egui::Grid::new("lsp").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
                     for (i, srv) in self.cfg.lsp_servers.iter_mut().enumerate() {
                         let mut exts = srv.extensions.join(",");
                         if ui.add(egui::TextEdit::singleline(&mut exts).desired_width(110.0)).changed() {
                             srv.extensions = exts.split(',').map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
                             changed = true;
                         }
+                        let found = lsp::resolve(&srv.command).is_some();
                         let mut cmdline = if srv.args.is_empty() { srv.command.clone() } else { format!("{} {}", srv.command, srv.args.join(" ")) };
                         if ui.add(egui::TextEdit::singleline(&mut cmdline).desired_width(260.0)).changed() {
                             let mut parts = cmdline.split_whitespace();
                             srv.command = parts.next().unwrap_or("").to_string();
                             srv.args = parts.map(|a| a.to_string()).collect();
                             changed = true;
+                        }
+                        if found {
+                            ui.label(egui::RichText::new("installed").small().color(egui::Color32::from_rgb(0x9e, 0xce, 0x6a)));
+                        } else {
+                            ui.label(egui::RichText::new("not found").small().weak());
                         }
                         if ui.small_button(icons::CLOSE).clicked() {
                             remove = Some(i);
@@ -1283,6 +1349,18 @@ impl ExplorerApp {
                             theme::apply(ctx, self.cfg.theme);
                             changed = true;
                         }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Editor font size");
+                    if ui.add(egui::Slider::new(&mut self.cfg.editor_font_size, 8.0..=24.0)).changed() {
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Editor font size");
+                    if ui.add(egui::Slider::new(&mut self.cfg.editor_font_size, 8.0..=24.0)).changed() {
+                        changed = true;
                     }
                 });
                 if ui.checkbox(&mut self.cfg.show_hidden, "Show hidden files").changed() {
@@ -1359,9 +1437,66 @@ impl ExplorerApp {
     }
 }
 
+impl ExplorerApp {
+    /// Hand an in-app drag to the OS once the pointer leaves the window, so a
+    /// file can be dropped on Explorer, Finder or another app. `start_drag`
+    /// runs the platform's own modal drag loop and only returns on drop or
+    /// cancel, so the UI stops repainting for the rest of the gesture; the
+    /// shell paints the drag image in the meantime.
+    fn maybe_hand_drag_to_os(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(payload) = egui::DragAndDrop::payload::<attach::DragPaths>(ctx) else {
+            self.os_drag_handed_off = false;
+            return;
+        };
+        if self.os_drag_handed_off {
+            return;
+        }
+        // The platform loop only ends when the button that started the drag is
+        // released, so never enter it unless that button is genuinely held.
+        // Without this the loop is entered on a stale payload and never returns,
+        // leaving a window that repaints but processes nothing.
+        let screen = ctx.screen_rect();
+        // Without pointer capture winit stops reporting positions once the
+        // cursor leaves, and egui clears `latest_pos`, so "no position while a
+        // button is held" is itself the signal that the drag has left.
+        let (held, outside) = ctx.input(|i| {
+            (i.pointer.primary_down(), i.pointer.latest_pos().map(|p| !screen.contains(p)).unwrap_or(true))
+        });
+        if !held {
+            return;
+        }
+        if !outside {
+            return;
+        }
+        self.os_drag_handed_off = true;
+        let paths = payload.0.clone();
+        egui::DragAndDrop::clear_payload(ctx);
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .collect();
+        // An empty image is fine: the crate skips the drag-image helper when it
+        // cannot decode one, and the shell falls back to its own icon.
+        match drag::start_drag(
+            frame,
+            drag::DragItem::Files(paths),
+            drag::Image::Raw(Vec::new()),
+            |_result, _pos| {},
+            drag::Options::default(),
+        ) {
+            Ok(()) => self.status = format!("Dragged {} to another app", names.join(", ")),
+            Err(e) => self.status = format!("OS drag failed: {e}"),
+        }
+    }
+}
+
 impl eframe::App for ExplorerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(t) = self.pending_theme.take() {
+            theme::apply(ctx, t);
+        }
         self.shortcuts(ctx);
+        self.maybe_hand_drag_to_os(ctx, frame);
 
         drag_preview(ctx);
         titlebar::show(ctx, "The Real Explorer");
@@ -1407,6 +1542,11 @@ impl eframe::App for ExplorerApp {
                 Body::Explorer => self.details_panel(ui),
                 Body::Ide => {
                     let servers = self.cfg.lsp_servers.clone();
+                    let size = self.cfg.editor_font_size;
+                    ui.style_mut().text_styles.insert(
+                        egui::TextStyle::Monospace,
+                        egui::FontId::new(size, egui::FontFamily::Monospace),
+                    );
                     self.editor.show(ui, &servers, self.cfg.format_json_on_save);
                     if !self.editor.status.is_empty() {
                         self.status = std::mem::take(&mut self.editor.status);

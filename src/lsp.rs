@@ -504,3 +504,36 @@ mod tests {
         );
     }
 }
+
+/// Resolve a server command against PATH the way the OS would, so the editor
+/// can tell "not installed" apart from "failed to start". A command that
+/// contains a separator is taken as a path and only checked for existence.
+pub fn resolve(command: &str) -> Option<std::path::PathBuf> {
+    let direct = Path::new(command);
+    if command.contains('/') || command.contains('\\') {
+        return direct.is_file().then(|| direct.to_path_buf());
+    }
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+            .split(';')
+            .map(|e| e.to_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let base = dir.join(command);
+        if base.is_file() {
+            return Some(base);
+        }
+        for ext in &exts {
+            let cand = dir.join(format!("{command}{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}

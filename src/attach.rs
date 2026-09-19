@@ -13,6 +13,27 @@ use std::path::{Path, PathBuf};
 /// Drag payload shared by every source so the drop zone tests one type.
 pub struct DragPaths(pub Vec<PathBuf>);
 
+/// Start a drag from a widget that senses clicks only.
+///
+/// `Sense::click_and_drag()` postpones the click/drag decision until egui is
+/// sure, so a few pixels of jitter between press and release swallow the
+/// click. Tree rows are navigation first, so they keep `Sense::click()` and
+/// this begins the drag once the pointer has passed egui's own click
+/// distance, which is the same threshold that disqualifies the click.
+pub fn drag_source(resp: &eframe::egui::Response, paths: impl FnOnce() -> Vec<PathBuf>) {
+    use eframe::egui::DragAndDrop;
+    if !resp.is_pointer_button_down_on() || DragAndDrop::has_any_payload(&resp.ctx) {
+        return;
+    }
+    let moved = resp.ctx.input(|i| match (i.pointer.press_origin(), i.pointer.interact_pos()) {
+        (Some(a), Some(b)) => (a - b).length() > 6.0,
+        _ => false,
+    });
+    if moved {
+        DragAndDrop::set_payload(&resp.ctx, DragPaths(paths()));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Text,
