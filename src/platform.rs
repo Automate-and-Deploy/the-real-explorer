@@ -136,3 +136,21 @@ fn cmd_with(bin: &str, args: &[&str], tail: &Path) -> Command {
     c.args(args).arg(tail);
     c
 }
+
+/// Show the OS "open with" chooser for `path`.
+///
+/// Windows has a shell dialog for this; macOS and Linux have no standard
+/// picker, so they fall back to the default handler and the caller can say so.
+pub fn open_with(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("rundll32.exe");
+        c.arg("shell32.dll,OpenAs_RunDLL").arg(path);
+        spawn(c)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("no 'open with' chooser on this platform".into())
+    }
+}

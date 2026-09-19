@@ -40,6 +40,20 @@ pub struct Config {
     pub format_json_on_save: bool,
     #[serde(default = "default_font_size")]
     pub editor_font_size: f32,
+    /// View state remembered between runs, so a relaunch does not reset the
+    /// sort and drop the user back at the process working directory.
+    #[serde(default)]
+    pub last_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub sort_key: String,
+    #[serde(default = "default_true")]
+    pub sort_asc: bool,
+    #[serde(default)]
+    pub group_by_type: bool,
+    #[serde(default)]
+    pub compact: bool,
+    #[serde(default = "default_true")]
+    pub show_tree: bool,
 }
 
 fn default_font_size() -> f32 {
@@ -126,6 +140,12 @@ impl Default for Config {
             lsp_servers: crate::lsp::default_servers(),
             format_json_on_save: true,
             editor_font_size: 13.0,
+            last_dir: None,
+            sort_key: "name".into(),
+            sort_asc: true,
+            group_by_type: false,
+            compact: false,
+            show_tree: true,
         }
     }
 }
