@@ -705,7 +705,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str("{\"b\":[1,{\"c\":true}],\"a\":\"x\"}").unwrap();
         let mut out = serde_json::to_string_pretty(&v).unwrap();
         out.push('\n');
-        assert!(out.starts_with("{\n  \"a\": \"x\""));
+        // preserve_order keeps the file's own key order; formatting must not reorder keys.
+        assert!(out.starts_with("{\n  \"b\": ["), "{out}");
         assert!(out.ends_with("}\n"));
     }
 }

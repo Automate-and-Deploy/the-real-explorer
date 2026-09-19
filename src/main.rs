@@ -11,6 +11,9 @@ mod chat;
 mod config;
 mod editor;
 mod harness;
+mod harness_ui;
+mod hooks;
+mod hooks_ui;
 mod icons;
 mod lsp;
 mod platform;
@@ -98,6 +101,8 @@ enum Modal {
     NewFile { name: String },
     Rename { path: PathBuf, name: String },
     Delete { path: PathBuf },
+    /// Delete an agent file or a whole skill folder via the harness window.
+    HarnessDelete { item: harness::Item },
 }
 
 struct ExplorerApp {
@@ -133,6 +138,7 @@ struct ExplorerApp {
     menu_row: Option<usize>,
     body: Body,
     editor: editor::Editor,
+    harness: harness_ui::HarnessWindow,
 }
 
 impl ExplorerApp {
@@ -166,10 +172,26 @@ impl ExplorerApp {
             menu_row: None,
             body: Body::Explorer,
             editor: editor::Editor::new(),
+            harness: harness_ui::HarnessWindow::new(),
         };
         app.reload();
         app.expand_ancestors(&start);
+        app.refresh_harness();
         app
+    }
+
+    /// Rescan agents and skills for the current folder and push the snapshot
+    /// into the chat pickers.
+    fn refresh_harness(&mut self) {
+        let cat = harness::scan(&self.cwd);
+        self.chat.agents = cat.agents.iter().map(|a| (a.name.clone(), a.scope.badge(), a.description.clone())).collect();
+        self.chat.skills = cat.skills.iter().map(|s| (s.name.clone(), s.description.clone())).collect();
+        if let Some(a) = &self.chat.agent {
+            if !cat.agents.iter().any(|x| &x.name == a) {
+                self.chat.agent = None;
+            }
+        }
+        self.harness.catalog = Some(cat);
     }
 
     fn save_cfg(&mut self) {
@@ -198,6 +220,7 @@ impl ExplorerApp {
         self.address = self.cwd.display().to_string();
         self.selected = None;
         self.reload();
+        self.refresh_harness();
         let cwd = self.cwd.clone();
         self.expand_ancestors(&cwd);
     }
@@ -515,6 +538,10 @@ impl ExplorerApp {
             Modal::Delete { path } => trash_ops::delete_to_trash(&path).map(|()| {
                 self.undo = Some(Undo::Delete(path));
             }),
+            Modal::HarnessDelete { item } => harness::delete(&item).map(|()| {
+                self.undo = Some(Undo::Delete(harness::delete_target(&item)));
+                self.refresh_harness();
+            }),
         };
         match r {
             Ok(()) => self.refresh_all(),
@@ -610,6 +637,10 @@ impl ExplorerApp {
                     self.save_cfg();
                     ui.close_menu();
                 }
+                if ui.button("Agents, skills and hooks").clicked() {
+                    self.harness.open = true;
+                    ui.close_menu();
+                }
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut changed = false;
@@ -655,7 +686,7 @@ impl ExplorerApp {
             }
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.address)
-                    .desired_width(ui.available_width() - 120.0),
+                    .desired_width(ui.available_width() - 160.0),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let p = PathBuf::from(self.address.trim());
@@ -667,6 +698,9 @@ impl ExplorerApp {
             }
             if ui.button(icons::SETTINGS).on_hover_text("Settings").clicked() {
                 self.settings_open = true;
+            }
+            if ui.button(icons::HARNESS).on_hover_text("Agents, skills and hooks").clicked() {
+                self.harness.open = true;
             }
         });
     }
@@ -1078,6 +1112,7 @@ impl ExplorerApp {
             Modal::NewFile { .. } => "New file",
             Modal::Rename { .. } => "Rename",
             Modal::Delete { .. } => "Delete",
+            Modal::HarnessDelete { .. } => "Delete",
         };
         egui::Window::new(title)
             .collapsible(false)
@@ -1094,6 +1129,11 @@ impl ExplorerApp {
                     }
                     Modal::Delete { path } => {
                         ui.label(format!("Move {} to the {}?", path.display(), trash_ops::bin_name()));
+                    }
+                    Modal::HarnessDelete { item } => {
+                        let target = harness::delete_target(item);
+                        let n = if target.is_dir() { fs::read_dir(&target).map(|rd| rd.count()).unwrap_or(0) } else { 1 };
+                        ui.label(format!("Move {} ({n} file(s)) to the {}?", target.display(), trash_ops::bin_name()));
                     }
                 }
                 ui.horizontal(|ui| {
@@ -1375,6 +1415,19 @@ impl eframe::App for ExplorerApp {
             }
         });
 
+        for ev in std::mem::take(&mut self.chat.hook_events) {
+            self.harness.push_hook_event(ev);
+        }
+        let project = self.cwd.clone();
+        for action in self.harness.show(ctx, &project) {
+            match action {
+                harness_ui::Action::OpenInIde(p) => self.open_in_ide(&p),
+                harness_ui::Action::Reveal(p) => self.reveal(&p),
+                harness_ui::Action::Delete(item) => self.modal = Some(Modal::HarnessDelete { item }),
+                harness_ui::Action::Refresh => self.refresh_harness(),
+                harness_ui::Action::Status(s) => self.status = s,
+            }
+        }
         self.modal_window(ctx);
         self.settings_window(ctx);
         self.properties_window(ctx);

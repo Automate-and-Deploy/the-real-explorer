@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::attach::{self, Attachment, DragPaths};
 use crate::config::{Backend, Config};
+use crate::harness_ui::HookEvent;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Role {
@@ -36,6 +37,7 @@ pub struct ChatMsg {
 
 enum Event {
     Session(String),
+    Hook(HookEvent),
     Text(String),
     Tool(String),
     Error(String),
@@ -48,6 +50,15 @@ pub struct ChatPanel {
     attachments: Vec<Attachment>,
     /// Last refusal or dedupe note, shown under the chips.
     attach_note: String,
+    /// `--agent` for the Claude Code backend. Changing it starts a new session.
+    pub agent: Option<String>,
+    /// (name, scope badge, description) snapshot for the picker.
+    pub agents: Vec<(String, &'static str, String)>,
+    /// (name, description) snapshot for the `/` picker.
+    pub skills: Vec<(String, String)>,
+    /// Hook receipts from the stream, drained by the app into the harness window.
+    pub hook_events: Vec<HookEvent>,
+    skill_pick: usize,
     input: String,
     messages: Vec<ChatMsg>,
     session_id: Option<String>,
@@ -61,6 +72,11 @@ impl ChatPanel {
             open,
             attachments: Vec::new(),
             attach_note: String::new(),
+            agent: None,
+            agents: Vec::new(),
+            skills: Vec::new(),
+            hook_events: Vec::new(),
+            skill_pick: 0,
             input: String::new(),
             messages: Vec::new(),
             session_id: None,
@@ -117,8 +133,17 @@ impl ChatPanel {
             Backend::ClaudeCode => {
                 let resume = self.session_id.clone();
                 let mode = cfg.claude_permission_mode.clone();
+                let agent = self.agent.clone();
+                // Attachments outside the cwd need --add-dir for the file tools to reach them.
+                let mut add_dirs: Vec<PathBuf> = Vec::new();
+                for a in &atts {
+                    let dir = if a.kind == attach::Kind::Folder { a.path.clone() } else { a.path.parent().map(|p| p.to_path_buf()).unwrap_or_default() };
+                    if !dir.starts_with(&cwd) && !add_dirs.contains(&dir) {
+                        add_dirs.push(dir);
+                    }
+                }
                 let full = attach::claude_block(&atts, &prompt);
-                thread::spawn(move || run_claude(tx, full, cwd, resume, mode));
+                thread::spawn(move || run_claude(tx, full, cwd, resume, mode, agent, add_dirs));
             }
             Backend::OpenAiCompatible => {
                 let cfg = cfg.clone();
@@ -141,6 +166,7 @@ impl ChatPanel {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 Event::Session(s) => self.session_id = Some(s),
+                Event::Hook(h) => self.hook_events.push(h),
                 Event::Text(t) => match self.messages.last_mut() {
                     Some(m) if m.role == Role::Assistant => m.text.push_str(&t),
                     _ => self.messages.push(ChatMsg { role: Role::Assistant, text: t }),
@@ -192,7 +218,45 @@ impl ChatPanel {
                         }
                     });
                 });
-                ui.small(format!("cwd: {}", cwd.display()));
+                ui.horizontal(|ui| {
+                    ui.small(format!("cwd: {}", cwd.display()));
+                });
+                if cfg.backend == Backend::ClaudeCode && !self.agents.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.small("Agent");
+                        let current = self.agent.clone().unwrap_or_else(|| "(default)".into());
+                        let mut picked: Option<Option<String>> = None;
+                        egui::ComboBox::from_id_salt("agent-pick")
+                            .selected_text(current)
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(self.agent.is_none(), "(default)").clicked() {
+                                    picked = Some(None);
+                                }
+                                for (name, badge, desc) in &self.agents {
+                                    let r = ui.selectable_label(self.agent.as_deref() == Some(name), format!("{badge} {name}"));
+                                    if !desc.is_empty() {
+                                        r.clone().on_hover_text(desc);
+                                    }
+                                    if r.clicked() {
+                                        picked = Some(Some(name.clone()));
+                                    }
+                                }
+                            });
+                        if let Some(p) = picked {
+                            if p != self.agent {
+                                // --agent is per session; make the reset visible rather than
+                                // silently applying it to a resumed one.
+                                self.agent = p.clone();
+                                self.session_id = None;
+                                self.messages.push(ChatMsg {
+                                    role: Role::Tool,
+                                    text: format!("new session: agent {}", p.unwrap_or_else(|| "(default)".into())),
+                                });
+                            }
+                        }
+                    });
+                }
                 ui.separator();
 
                 let input_h = 90.0;
@@ -235,7 +299,67 @@ impl ChatPanel {
                         self.attachments.clear();
                     }
                 }
-                let enter = resp.has_focus()
+                // `/` skill picker: only when the input starts with `/` (or a line does)
+                // and has no space yet, so `src/foo.rs` mid-sentence never opens it.
+                let slash_filter: Option<String> = {
+                    let last_line = self.input.rsplit('\n').next().unwrap_or("");
+                    last_line.strip_prefix('/').filter(|rest| !rest.contains(' ')).map(|r| r.to_lowercase())
+                };
+                let mut picker_took_enter = false;
+                if let (Some(filter), false) = (&slash_filter, self.skills.is_empty()) {
+                    let matches: Vec<(String, String)> = self
+                        .skills
+                        .iter()
+                        .filter(|(n, _)| n.to_lowercase().contains(filter))
+                        .take(10)
+                        .cloned()
+                        .collect();
+                    if !matches.is_empty() && resp.has_focus() {
+                        self.skill_pick = self.skill_pick.min(matches.len() - 1);
+                        let mut chosen: Option<String> = None;
+                        ui.input_mut(|i| {
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                self.skill_pick = (self.skill_pick + 1).min(matches.len() - 1);
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                self.skill_pick = self.skill_pick.saturating_sub(1);
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                                chosen = Some(matches[self.skill_pick].0.clone());
+                                picker_took_enter = true;
+                            }
+                        });
+                        let anchor = resp.rect.left_top();
+                        egui::Area::new(ui.id().with("skill-pick"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(anchor - egui::vec2(0.0, 8.0 + 22.0 * matches.len() as f32))
+                            .show(ctx, |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(resp.rect.width());
+                                    for (i, (n, d)) in matches.iter().enumerate() {
+                                        let text = if d.is_empty() { format!("/{n}") } else { format!("/{n}    {}", d.chars().take(60).collect::<String>()) };
+                                        if ui.selectable_label(i == self.skill_pick, text).clicked() {
+                                            chosen = Some(n.clone());
+                                        }
+                                    }
+                                });
+                            });
+                        if let Some(name) = chosen {
+                            // Replace the `/filter` on the last line with `/name `.
+                            let cut = self.input.rfind('/').unwrap_or(0);
+                            self.input.truncate(cut);
+                            self.input.push_str(&format!("/{name} "));
+                            // Move the caret to the end.
+                            let id = resp.id;
+                            let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+                            let end = self.input.chars().count();
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+                            egui::TextEdit::store_state(ctx, id, st);
+                        }
+                    }
+                }
+                let enter = !picker_took_enter
+                    && resp.has_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();
                 if (enter || clicked) && !self.busy && !self.input.trim().is_empty() {
@@ -319,7 +443,15 @@ impl ChatPanel {
 
 // ---------- backends ----------
 
-fn run_claude(tx: Sender<Event>, prompt: String, cwd: PathBuf, resume: Option<String>, mode: String) {
+fn run_claude(
+    tx: Sender<Event>,
+    prompt: String,
+    cwd: PathBuf,
+    resume: Option<String>,
+    mode: String,
+    agent: Option<String>,
+    add_dirs: Vec<PathBuf>,
+) {
     let mut cmd = Command::new("claude");
     cmd.current_dir(&cwd)
         .arg("-p")
@@ -331,6 +463,15 @@ fn run_claude(tx: Sender<Event>, prompt: String, cwd: PathBuf, resume: Option<St
         .arg(mode);
     if let Some(sid) = resume {
         cmd.arg("--resume").arg(sid);
+    }
+    if let Some(a) = agent {
+        cmd.arg("--agent").arg(a);
+    }
+    if !add_dirs.is_empty() {
+        cmd.arg("--add-dir");
+        for d in &add_dirs {
+            cmd.arg(d);
+        }
     }
     cmd.arg(prompt)
         .stdin(Stdio::null())
@@ -366,11 +507,32 @@ fn run_claude(tx: Sender<Event>, prompt: String, cwd: PathBuf, resume: Option<St
     });
 
     for line in BufReader::new(stdout).lines().flatten() {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            // A message worse than the truth, so seeing it is a bug report.
+            let head: String = line.chars().take(200).collect();
+            let _ = tx.send(Event::Tool(format!("unparsed stream line ({} bytes): {head}", line.len())));
+            continue;
+        };
         match v["type"].as_str().unwrap_or("") {
             "system" if v["subtype"] == "init" => {
                 if let Some(s) = v["session_id"].as_str() {
                     let _ = tx.send(Event::Session(s.to_string()));
+                }
+            }
+            "system" if v["subtype"] == "hook_started" || v["subtype"] == "hook_response" => {
+                let _ = tx.send(Event::Hook(HookEvent {
+                    name: v["hook_name"].as_str().unwrap_or("").to_string(),
+                    outcome: if v["subtype"] == "hook_started" { "started".into() } else { v["outcome"].as_str().unwrap_or("").to_string() },
+                    exit_code: v["exit_code"].as_i64(),
+                    stdout: v["stdout"].as_str().unwrap_or("").to_string(),
+                    stderr: v["stderr"].as_str().unwrap_or("").to_string(),
+                }));
+            }
+            "rate_limit_event" => {
+                if let Some(u) = v["rate_limit_info"]["unifiedWindows"]["five_hour"]["utilization"].as_f64() {
+                    if u > 0.9 {
+                        let _ = tx.send(Event::Tool(format!("rate limit: five-hour window at {:.0}%", u * 100.0)));
+                    }
                 }
             }
             "stream_event" => {
@@ -385,7 +547,12 @@ fn run_claude(tx: Sender<Event>, prompt: String, cwd: PathBuf, resume: Option<St
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
                         let name = b["name"].as_str().unwrap_or("tool");
-                        let short: String = b["input"].to_string().chars().take(160).collect();
+                        let full = b["input"].to_string();
+                        let n = full.chars().count();
+                        let mut short: String = full.chars().take(160).collect();
+                        if n > 160 {
+                            short.push_str(&format!(" … (+{} chars)", n - 160));
+                        }
                         let _ = tx.send(Event::Tool(format!("{name} {short}")));
                     }
                 }

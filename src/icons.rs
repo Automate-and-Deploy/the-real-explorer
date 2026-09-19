@@ -29,6 +29,7 @@ pub const CARET_CLOSED: &str = ph::CARET_RIGHT;
 pub const DRIVE: &str = ph::HARD_DRIVE;
 pub const EXPLORER: &str = ph::FOLDERS;
 pub const IDE: &str = ph::CODE;
+pub const HARNESS: &str = ph::ROBOT;
 pub const MINIMIZE: &str = ph::MINUS;
 pub const MAXIMIZE: &str = ph::SQUARE;
 pub const RESTORE: &str = ph::COPY_SIMPLE;
