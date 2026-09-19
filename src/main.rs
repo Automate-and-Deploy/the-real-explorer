@@ -1399,12 +1399,6 @@ impl ExplorerApp {
                         changed = true;
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Editor font size");
-                    if ui.add(egui::Slider::new(&mut self.cfg.editor_font_size, 8.0..=24.0)).changed() {
-                        changed = true;
-                    }
-                });
                 if ui.checkbox(&mut self.cfg.show_hidden, "Show hidden files").changed() {
                     reload = true;
                     changed = true;
