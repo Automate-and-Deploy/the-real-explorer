@@ -31,13 +31,20 @@ runs; a locally built copy run from disk generally does not trigger it.
 
 ## Linux
 
-The `.deb` declares `libgtk-3-0`, `libxkbcommon0` and `libwayland-client0`. A
-build machine additionally needs the development packages for winit and glutin:
+Building needs a C compiler and nothing else: `sudo apt-get install -y build-essential`.
+No X11, Wayland, GL, GTK or fontconfig development packages are required, and
+`libssl-dev` is not either, since the HTTP client uses rustls. Verified from a
+cold build on Ubuntu 24.04 with every GUI dev package removed.
 
-```
-sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-    libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
-```
+The window libraries are loaded at runtime rather than linked, so the ELF
+NEEDED list is only libc and friends and `dpkg-shlibdeps` derives nothing. The
+`.deb` therefore declares them by hand, in `Cargo.toml`. Without
+`libxkbcommon-x11-0` the installed app panics at startup, which was verified in
+a bare `ubuntu:24.04` container.
+
+Dragging a file out to another application is not available on Linux: the
+underlying crate needs a GTK application window that eframe cannot supply, so
+the app reports the gesture as unsupported rather than pulling in GTK.
 
 ## macOS
 

@@ -1,8 +1,17 @@
-//! Custom window chrome drawn with the app theme. The OS title bar is turned
-//! off at launch (`ViewportBuilder::with_decorations(false)`); this module
-//! draws a title strip that moves the window on drag, toggles maximise on
-//! double-click, hosts minimise/maximise/close buttons, and turns the outer
-//! few pixels of the window into resize handles.
+//! Custom window chrome drawn with the app theme.
+//!
+//! Windows and Linux launch undecorated, so this module draws the whole
+//! strip: drag to move, double-click to maximise, minimise/maximise/close
+//! buttons, and resize handles on the outer few pixels.
+//!
+//! macOS keeps its real title bar, made transparent with the title text
+//! hidden, and the app paints underneath it. Only the icon and title are ours
+//! there: the buttons are skipped because macOS draws its own traffic lights
+//! at the left, and the resize handles are skipped because
+//! `drag_resize_window` is unsupported there, so they would swallow the
+//! pointer at the window edges and do nothing. The native title bar view
+//! still spans the window and takes clicks in the top ~28 points, so nothing
+//! interactive belongs in that strip on macOS.
 
 use eframe::egui::{self, CursorIcon, ResizeDirection, Sense, ViewportCommand};
 

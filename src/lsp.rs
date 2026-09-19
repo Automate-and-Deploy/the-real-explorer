@@ -456,7 +456,14 @@ mod tests {
         let path = root.join("src").join("main.rs");
         let base = std::fs::read_to_string(&path).unwrap();
         let probe_line = base.lines().count() as u32; // zero-based line of the probe body
-        let text = format!("{base}    let _x = std::\n");
+        // Derive the column from the probe text rather than hardcoding it: the
+        // request has to land right after `std::`, and a literal silently drifts
+        // the moment the line gains indentation. Asking four columns early is
+        // still a valid request, so it returns in-scope names and the failure
+        // looks like a broken server rather than a mis-aimed probe.
+        const PROBE: &str = "    let _x = std::";
+        let probe_col = PROBE.encode_utf16().count() as u32;
+        let text = format!("{base}{PROBE}\n");
         client.did_open(&path, "rust", &text);
 
         let start = Instant::now();
@@ -492,9 +499,8 @@ mod tests {
             if items.is_some() {
                 break;
             }
-            // Line 1, after `std::` which is 14 UTF-16 units in.
             if initialized && req.is_none() && last_ask.elapsed() > Duration::from_secs(2) {
-                req = Some(client.completion(&path, probe_line, 14));
+                req = Some(client.completion(&path, probe_line, probe_col));
                 last_ask = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -502,8 +508,13 @@ mod tests {
         client.shutdown();
         let items = items.expect("no completion items from rust-analyzer within 120s");
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // rust-analyzer labels a module completion with the `::` it is about to
+        // insert, so match on the bare name rather than the label as sent.
         assert!(
-            labels.iter().any(|l| *l == "collections" || *l == "fs" || *l == "io"),
+            labels.iter().any(|l| {
+                let l = l.trim_end_matches("::");
+                l == "collections" || l == "fs" || l == "io"
+            }),
             "expected std modules, got {:?}",
             &labels[..labels.len().min(20)]
         );

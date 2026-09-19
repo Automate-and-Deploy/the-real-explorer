@@ -7,7 +7,9 @@
 //!   Trash spec (version 1.0). `os_limited` is also available here, so
 //!   [`restore`] works, provided the desktop environment follows the spec
 //!   (GNOME, KDE, XFCE do).
-//! - **macOS**: files move to `~/.Trash` via the Finder API. The `trash` crate
+//! - **macOS**: files move to `~/.Trash` via `NSFileManager`, not Finder,
+//!   because the Finder route needs an Automation permission grant and hangs
+//!   for a minute without one, leaving the file on disk. The `trash` crate
 //!   does not expose `os_limited::list`/`restore` on macOS, so [`restore`]
 //!   always returns `Err`.
 //!
@@ -108,7 +110,7 @@ pub fn restore(_original: &Path) -> Result<bool, String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Builds a unique path under the system temp dir so parallel test runs
     /// (and repeated local runs) never collide.
@@ -154,9 +156,18 @@ mod tests {
         let path = unique_temp_path("does-not-exist");
         assert!(!path.exists());
 
+        let start = Instant::now();
         let result = delete_to_trash(&path);
+        let elapsed = start.elapsed();
 
         assert!(result.is_err());
+        // Fast, not just failed. Asserting only `is_err` let this pass on macOS
+        // while the Finder route sat in a 60 s Apple Event timeout and nothing
+        // was ever deleted: the timeout was itself the error being asserted.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should fail because the path is missing, not by timing out: took {elapsed:?}"
+        );
     }
 
     #[cfg(windows)]

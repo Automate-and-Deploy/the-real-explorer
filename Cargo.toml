@@ -47,7 +47,14 @@ allow-downgrades = true
 installer-mode = "currentUser"
 
 [package.metadata.packager.deb]
-depends = ["libgl1", "libxkbcommon0", "libwayland-client0", "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libfontconfig1"]
+# Every entry here is dlopen-ed by winit and glutin at runtime rather than
+# linked, so the ELF NEEDED list is only libc, libm and libgcc_s and
+# dpkg-shlibdeps derives nothing. This list is maintained by hand. Verified
+# in a bare ubuntu:24.04 container: without libxkbcommon-x11-0 the app panics
+# at startup with "Library libxkbcommon-x11.so could not be loaded", and
+# libegl1 with libwayland-egl1 are the Wayland GL path, which is the default
+# session on Ubuntu 24.04.
+depends = ["libgl1", "libegl1", "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0", "libwayland-egl1", "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libfontconfig1"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"

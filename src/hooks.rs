@@ -466,14 +466,44 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<std::process::Child
         .spawn()
 }
 
+/// PATH with the directories a desktop launch never inherits appended.
+///
+/// Same set `lsp::resolve` searches, so a hook and a language server agree on
+/// where user-installed tools live.
+#[cfg(not(windows))]
+fn augmented_path() -> std::ffi::OsString {
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    if let Some(home) = dirs::home_dir() {
+        for sub in [".cargo/bin", ".local/bin", ".bun/bin"] {
+            dirs.push(home.join(sub));
+        }
+    }
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let p = std::path::PathBuf::from(extra);
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
 #[cfg(not(windows))]
 fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<std::process::Child> {
-    // `-l`: an app launched from Finder or the Dock inherits a bare PATH
-    // (/usr/bin:/bin:/usr/sbin:/sbin) and no profile, so a hook that lives in
-    // ~/.cargo/bin or /opt/homebrew/bin is otherwise unreachable.
+    // A plain `sh -c`, with PATH extended by hand.
+    //
+    // An app launched from the Dock, Finder or a .desktop file inherits a bare
+    // PATH and no profile, so a hook in ~/.cargo/bin would be unreachable. A
+    // login shell would fix that but costs more than it gives on Linux, where
+    // /bin/sh is dash and dash treats a failed `.` as fatal: one stale line in
+    // ~/.profile left by a removed toolchain makes every hook exit 2 with no
+    // output and no explanation. Measured on a real box whose profile still
+    // sourced a deleted cargo env. Extending PATH ourselves is deterministic,
+    // needs no profile, and matches how `lsp::resolve` finds servers.
     ProcCommand::new("sh")
-        .arg("-lc")
+        .arg("-c")
         .arg(command)
+        .env("PATH", augmented_path())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -815,6 +845,35 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("hi"), "stdout was: {:?}", result.stdout);
         assert!(!result.timed_out);
+    }
+
+    /// Covers the `sh -lc` branch. A login shell is used so a hook can find
+    /// tools installed under the user's profile, which a GUI-launched app
+    /// would otherwise miss; this proves the spawn still works.
+    #[test]
+    #[cfg(not(windows))]
+    fn run_test_echo_succeeds_on_unix() {
+        let cwd = std::env::temp_dir();
+        let result = run_test("echo hi", "", &cwd, Duration::from_secs(10));
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+        assert!(result.stdout.contains("hi"), "stdout was: {:?}", result.stdout);
+        assert!(!result.timed_out);
+    }
+
+    /// A login shell sources profile scripts, which are free to print. Anything
+    /// they emit lands in the hook's captured stdout, so keep an eye on it.
+    #[test]
+    #[cfg(not(windows))]
+    fn run_test_passes_quoted_paths_through_unchanged_on_unix() {
+        let dir = std::env::temp_dir().join(format!("tre hooks {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x y.txt");
+        std::fs::write(&file, "quoted-ok").unwrap();
+        let cmd = format!("cat \"{}\"", file.display());
+        let r = run_test(&cmd, "", &dir, Duration::from_secs(10));
+        assert_eq!(r.exit_code, Some(0), "stderr: {}", r.stderr);
+        assert!(r.stdout.contains("quoted-ok"), "stdout: {}", r.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

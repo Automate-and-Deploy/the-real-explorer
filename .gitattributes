@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings: a CRLF package.sh fails on macOS and
+# Linux before it does anything, with
+#   packaging/package.sh: line 10: set: pipefail: invalid option name
+# because the shell reads the trailing CR as part of the option name.
+*.sh text eol=lf

@@ -164,6 +164,8 @@ struct ExplorerApp {
     /// Theme asked for by a project's `.code/settings.json`, applied on the
     /// next frame because loading happens where there is no egui context.
     pending_theme: Option<Theme>,
+    /// In-flight agent and skill scan; see `refresh_harness`.
+    harness_rx: Option<std::sync::mpsc::Receiver<harness::Catalog>>,
 }
 
 impl ExplorerApp {
@@ -200,6 +202,7 @@ impl ExplorerApp {
             harness: harness_ui::HarnessWindow::new(),
             os_drag_handed_off: false,
             pending_theme: None,
+            harness_rx: None,
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -223,8 +226,28 @@ impl ExplorerApp {
 
     /// Rescan agents and skills for the current folder and push the snapshot
     /// into the chat pickers.
+    /// Start a scan on a worker thread and return immediately.
+    ///
+    /// This walks `.claude` in the project and in the home directory, and one
+    /// slow entry there is enough to stop the window ever appearing if it runs
+    /// on the main thread: on a Mac whose `~/.claude/skills` holds symlinks
+    /// onto an external volume, the scan blocked in the kernel during app
+    /// creation and the app launched to nothing. A network share, a stale
+    /// mount or an offloaded cloud folder would do the same anywhere.
     fn refresh_harness(&mut self) {
-        let cat = harness::scan(&self.cwd);
+        let cwd = self.cwd.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(harness::scan(&cwd));
+        });
+        self.harness_rx = Some(rx);
+    }
+
+    /// Take a finished scan, if one has arrived. Called once per frame.
+    fn poll_harness(&mut self) {
+        let Some(rx) = &self.harness_rx else { return };
+        let Ok(cat) = rx.try_recv() else { return };
+        self.harness_rx = None;
         self.chat.agents = cat.agents.iter().map(|a| (a.name.clone(), a.scope.badge(), a.description.clone())).collect();
         self.chat.skills = cat.skills.iter().map(|s| (s.name.clone(), s.description.clone())).collect();
         if let Some(a) = &self.chat.agent {
@@ -1600,6 +1623,7 @@ impl eframe::App for ExplorerApp {
             }
         });
 
+        self.poll_harness();
         for ev in std::mem::take(&mut self.chat.hook_events) {
             self.harness.push_hook_event(ev);
         }
@@ -1612,6 +1636,9 @@ impl eframe::App for ExplorerApp {
                 harness_ui::Action::Refresh => self.refresh_harness(),
                 harness_ui::Action::Status(s) => self.status = s,
             }
+        }
+        if self.harness_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
         self.modal_window(ctx);
         self.settings_window(ctx);
