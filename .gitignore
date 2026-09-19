@@ -1,1 +1,4 @@
 /target
+
+# packaging output
+/dist

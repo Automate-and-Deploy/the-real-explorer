@@ -22,3 +22,27 @@ egui_commonmark = "0.18"
 [profile.release]
 opt-level = 3
 strip = true
+
+[package.metadata.packager]
+product-name = "The Real Explorer"
+identifier = "org.newingham.therealexplorer"
+description = "File explorer, editor and assistant in one window"
+long-description = "A file explorer with a VS Code style folder tree, a built-in editor with language server support, and an assistant panel that drives Claude Code or any OpenAI-compatible endpoint."
+authors = ["Alan Newingham"]
+category = "Utility"
+icons = ["packaging/icons/icon.png", "packaging/icons/icon.ico"]
+out-dir = "dist"
+before-packaging-command = "cargo build --release"
+
+[package.metadata.packager.windows]
+# Per-user install needs no elevation and matches how the app stores config.
+allow-downgrades = true
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+
+[package.metadata.packager.deb]
+depends = ["libgtk-3-0", "libxkbcommon0", "libwayland-client0"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
