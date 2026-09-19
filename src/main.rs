@@ -166,11 +166,14 @@ struct ExplorerApp {
     pending_theme: Option<Theme>,
     /// In-flight agent and skill scan; see `refresh_harness`.
     harness_rx: Option<std::sync::mpsc::Receiver<harness::Catalog>>,
+    /// Row the pointer went down on in the details list, so a drag that starts
+    /// there carries that file even after the pointer has moved off the row.
+    drag_row: Option<usize>,
 }
 
 impl ExplorerApp {
     fn new() -> Self {
-        let cfg = Config::load();
+        let (cfg, cfg_note) = Config::load();
         let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
         let mut app = Self {
             chat: chat::ChatPanel::new(cfg.chat_open),
@@ -203,11 +206,15 @@ impl ExplorerApp {
             os_drag_handed_off: false,
             pending_theme: None,
             harness_rx: None,
+            drag_row: None,
         };
         app.reload();
         app.expand_ancestors(&start);
         app.refresh_harness();
         app.apply_project_settings();
+        if let Some(note) = cfg_note {
+            app.status = note;
+        }
         app
     }
 
@@ -235,6 +242,12 @@ impl ExplorerApp {
     /// creation and the app launched to nothing. A network share, a stale
     /// mount or an offloaded cloud folder would do the same anywhere.
     fn refresh_harness(&mut self) {
+        // One at a time: the harness window asks for a refresh on every frame
+        // until a catalog arrives, so without this a slow scan spawns a thread
+        // per frame against the very filesystem that is already slow.
+        if self.harness_rx.is_some() {
+            return;
+        }
         let cwd = self.cwd.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -968,6 +981,21 @@ impl ExplorerApp {
             } else if bg.clicked() {
                 action = Some((i, false));
             }
+        }
+        // Dragging a row to the assistant panel. The catch-all keeps click
+        // sense, and the drag starts by hand past egui's click distance, for
+        // the same reason the tree labels do: `click_and_drag` would postpone
+        // every click decision and make single clicks unreliable.
+        let (pressed, down) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));
+        if pressed && hovered_row.is_some() {
+            self.drag_row = hovered_row;
+        }
+        if !down {
+            self.drag_row = None;
+        }
+        if let Some(i) = self.drag_row.filter(|i| *i < entries.len()) {
+            let path = entries[i].path.clone();
+            attach::drag_source(&bg, || vec![path]);
         }
         if bg.secondary_clicked() {
             self.menu_row = hovered_row;
@@ -1759,8 +1787,18 @@ fn unique_name(p: &Path) -> PathBuf {
     }
 }
 
+/// Copy a file or a directory tree.
+///
+/// Symlinks are skipped rather than followed. `Path::is_dir` follows them, and
+/// a link pointing back at an ancestor made this recurse until the stack ran
+/// out and the process died: reachable from an ordinary paste, or from a cut
+/// across volumes, which falls back to copy then delete.
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
+    let md = fs::symlink_metadata(src)?;
+    if md.file_type().is_symlink() {
+        return Ok(());
+    }
+    if md.is_dir() {
         fs::create_dir_all(dst)?;
         for de in fs::read_dir(src)? {
             let de = de?;

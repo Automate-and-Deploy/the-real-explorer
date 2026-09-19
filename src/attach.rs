@@ -16,21 +16,46 @@ pub struct DragPaths(pub Vec<PathBuf>);
 /// Start a drag from a widget that senses clicks only.
 ///
 /// `Sense::click_and_drag()` postpones the click/drag decision until egui is
-/// sure, so a few pixels of jitter between press and release swallow the
-/// click. Tree rows are navigation first, so they keep `Sense::click()` and
-/// this begins the drag once the pointer has passed egui's own click
-/// distance, which is the same threshold that disqualifies the click.
+/// sure, so a little jitter, or simply holding the button a moment too long,
+/// swallows the click. Tree rows and list rows are navigation first, so they
+/// keep `Sense::click()` and this starts the drag by hand.
+///
+/// It tracks the press itself rather than asking the response: egui drops a
+/// widget's click candidate as soon as the pointer moves past click distance,
+/// so `is_pointer_button_down_on` goes false exactly when a drag begins, which
+/// is the moment this needs it.
 pub fn drag_source(resp: &eframe::egui::Response, paths: impl FnOnce() -> Vec<PathBuf>) {
-    use eframe::egui::DragAndDrop;
-    if !resp.is_pointer_button_down_on() || DragAndDrop::has_any_payload(&resp.ctx) {
+    use eframe::egui::{DragAndDrop, Id, Pos2};
+    const PRESS: &str = "tre-drag-press";
+    /// Same distance egui uses to disqualify a click, so a press is either one
+    /// or the other and never both.
+    const THRESHOLD: f32 = 6.0;
+
+    let ctx = &resp.ctx;
+    let key = Id::new(PRESS);
+    let (pressed, down, pos) = ctx.input(|i| {
+        (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos())
+    });
+    if pressed && resp.contains_pointer() {
+        if let Some(p) = pos {
+            ctx.data_mut(|d| d.insert_temp(key, (resp.id, p)));
+        }
+    }
+    if !down {
+        ctx.data_mut(|d| d.remove::<(Id, Pos2)>(key));
         return;
     }
-    let moved = resp.ctx.input(|i| match (i.pointer.press_origin(), i.pointer.interact_pos()) {
-        (Some(a), Some(b)) => (a - b).length() > 6.0,
-        _ => false,
-    });
-    if moved {
-        DragAndDrop::set_payload(&resp.ctx, DragPaths(paths()));
+    if DragAndDrop::has_any_payload(ctx) {
+        return;
+    }
+    let Some((id, origin)) = ctx.data(|d| d.get_temp::<(Id, Pos2)>(key)) else { return };
+    if id != resp.id {
+        return;
+    }
+    if let Some(now) = pos {
+        if (now - origin).length() > THRESHOLD {
+            DragAndDrop::set_payload(ctx, DragPaths(paths()));
+        }
     }
 }
 

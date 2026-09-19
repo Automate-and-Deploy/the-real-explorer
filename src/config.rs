@@ -138,11 +138,22 @@ impl Config {
             .join("config.json")
     }
 
-    pub fn load() -> Self {
-        fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Load the saved settings, with a note when the file exists but could not
+    /// be used. Falling back to defaults in silence looks identical to the app
+    /// forgetting the backend, the key and the server list on its own.
+    pub fn load() -> (Self, Option<String>) {
+        let p = Self::path();
+        match fs::read_to_string(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
+            Err(e) => (Self::default(), Some(format!("Settings not read ({e}); using defaults: {}", p.display()))),
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(cfg) => (cfg, None),
+                Err(e) => (
+                    Self::default(),
+                    Some(format!("Settings not understood ({e}); using defaults without overwriting {}", p.display())),
+                ),
+            },
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {

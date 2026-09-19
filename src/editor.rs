@@ -144,6 +144,12 @@ impl Editor {
         if let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) {
             c.did_close(&d.path);
         }
+        // Removing an earlier tab shifts every later index down, so the active
+        // index has to follow it or the editor silently shows a different file
+        // than the one the tab strip highlights.
+        if i < self.active {
+            self.active -= 1;
+        }
         if self.active >= self.docs.len() && !self.docs.is_empty() {
             self.active = self.docs.len() - 1;
         }
@@ -267,6 +273,12 @@ impl Editor {
         let chars: Vec<char> = d.text.chars().collect();
         let start = comp.prefix_start.min(chars.len());
         let end = self.cursor_char.min(chars.len());
+        // The prefix start was recorded when the list arrived. If the caret has
+        // since moved before it, splicing the two slices would duplicate the
+        // text between them rather than replace it.
+        if end < start {
+            return;
+        }
         let mut new_text: String = chars[..start].iter().collect();
         new_text.push_str(&item.insert_text);
         let new_cursor = new_text.chars().count();

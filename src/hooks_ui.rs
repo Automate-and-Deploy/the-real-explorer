@@ -15,6 +15,9 @@ use crate::hooks::{self, Command, Group, Hooks, Loaded, Scope, TestResult, KNOWN
 
 pub struct HooksEditor {
     scope: Scope,
+    /// Scope the loaded document came from, to put the picker back when a
+    /// switch is refused because of unsaved edits.
+    loaded_scope: Scope,
     loaded: Option<Loaded>,
     edit: Hooks,
     load_error: Option<String>,
@@ -37,6 +40,7 @@ impl HooksEditor {
     pub fn new() -> Self {
         Self {
             scope: Scope::User,
+            loaded_scope: Scope::User,
             loaded: None,
             edit: Hooks::default(),
             load_error: None,
@@ -56,6 +60,7 @@ impl HooksEditor {
                     self.edit = l.hooks.clone();
                     self.loaded = Some(l);
                     self.dirty = false;
+                    self.loaded_scope = self.scope;
                 }
                 Err(e) => {
                     self.loaded = None;
@@ -75,10 +80,25 @@ impl HooksEditor {
             changed |= ui.selectable_value(&mut self.scope, Scope::Project, "project").changed();
             changed |= ui.selectable_value(&mut self.scope, Scope::ProjectLocal, "project-local").changed();
             changed |= ui.selectable_value(&mut self.scope, Scope::User, "user").changed();
+            // Unsaved hook commands are hand-written and not recoverable, so a
+            // scope switch or reload that would discard them asks first.
             if changed {
-                self.reload(project);
+                if self.dirty {
+                    self.scope = self.loaded_scope;
+                    self.status = "Unsaved changes: save them, or press Discard to reload".into();
+                } else {
+                    self.reload(project);
+                }
             }
             if ui.button("Reload").clicked() {
+                if self.dirty {
+                    self.status = "Unsaved changes: press Discard to throw them away".into();
+                } else {
+                    self.reload(project);
+                }
+            }
+            if self.dirty && ui.button("Discard").clicked() {
+                self.dirty = false;
                 self.reload(project);
             }
             let can_save = self.loaded.is_some() && self.dirty;

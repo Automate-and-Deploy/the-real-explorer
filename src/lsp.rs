@@ -328,7 +328,10 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // kill() only signals. Without the wait the entry stays as a zombie on
+        // Unix until the app itself exits, one per server restart or crash.
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

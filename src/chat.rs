@@ -44,6 +44,13 @@ enum Event {
     Done,
 }
 
+/// Transcript entries kept in memory. Older ones are dropped: the panel is
+/// meant to stay open all day, and the OpenAI-compatible backend resends the
+/// history on every turn, so unbounded growth costs memory and tokens.
+const MAX_MESSAGES: usize = 400;
+/// User and assistant turns resent as context to an OpenAI-compatible endpoint.
+const MAX_HISTORY_TURNS: usize = 40;
+
 pub struct ChatPanel {
     pub open: bool,
     /// Dropped paths waiting for the next send. Cleared on send.
@@ -114,6 +121,11 @@ impl ChatPanel {
             .filter(|m| matches!(m.role, Role::User | Role::Assistant))
             .map(|m| json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": m.text}))
             .collect();
+        let history: Vec<Value> = if history.len() > MAX_HISTORY_TURNS {
+            history[history.len() - MAX_HISTORY_TURNS..].to_vec()
+        } else {
+            history
+        };
 
         let atts = std::mem::take(&mut self.attachments);
         self.attach_note.clear();
@@ -178,6 +190,10 @@ impl ChatPanel {
                 Event::Error(e) => self.messages.push(ChatMsg { role: Role::Error, text: e }),
                 Event::Done => done = true,
             }
+        }
+        if self.messages.len() > MAX_MESSAGES {
+            let cut = self.messages.len() - MAX_MESSAGES;
+            self.messages.drain(..cut);
         }
         if done {
             self.busy = false;
