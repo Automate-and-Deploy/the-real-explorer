@@ -1,4 +1,4 @@
-//! rust-explorer: a Windows Explorer style file browser with a VS Code style
+//! The Real Explorer: a Windows Explorer style file browser with a VS Code style
 //! folder tree in the sidebar and an optional AI chat on the right.
 //! Left pane is a lazily expanded directory tree, centre is a sortable details
 //! list for the current directory. Menus cover file operations, settings hold
@@ -32,11 +32,11 @@ fn main() -> eframe::Result {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0])
             .with_decorations(false)
-            .with_title("Rust Explorer"),
+            .with_title("The Real Explorer"),
         ..Default::default()
     };
     eframe::run_native(
-        "Rust Explorer",
+        "The Real Explorer",
         options,
         Box::new(|cc| {
             icons::install(&cc.egui_ctx);
@@ -1306,7 +1306,7 @@ impl eframe::App for ExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
 
-        titlebar::show(ctx, "Rust Explorer");
+        titlebar::show(ctx, "The Real Explorer");
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ctx, ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);

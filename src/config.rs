@@ -58,7 +58,7 @@ impl Config {
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("rust-explorer")
+            .join("the-real-explorer")
             .join("config.json")
     }
 
