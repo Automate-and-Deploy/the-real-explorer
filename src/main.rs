@@ -702,6 +702,8 @@ impl ExplorerApp {
         };
 
         let mut hovered_row: Option<usize> = None;
+        // Only the list area, not the tab strip above it.
+        let pane = ui.available_rect_before_wrap();
 
         TableBuilder::new(ui)
             .striped(true)
@@ -757,7 +759,7 @@ impl ExplorerApp {
         // One catch-all interact over the whole pane, registered after the rows so it
         // is the topmost widget and owns the single context menu. Which items it shows
         // depends on the row under the pointer when the right button went down.
-        let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), egui::Sense::click());
+        let bg = ui.interact(pane, ui.id().with("bg"), egui::Sense::click());
         if let Some(i) = hovered_row {
             if bg.double_clicked() {
                 action = Some((i, true));
