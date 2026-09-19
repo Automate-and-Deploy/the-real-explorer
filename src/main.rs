@@ -202,6 +202,8 @@ struct ExplorerApp {
     /// True once an in-app drag has been handed to the OS this gesture, so the
     /// hand-off happens once per drag rather than every frame.
     os_drag_handed_off: bool,
+    /// Files with unsaved changes that stopped the window closing.
+    exit_prompt: Option<Vec<PathBuf>>,
     /// Theme asked for by a project's `.code/settings.json`, applied on the
     /// next frame because loading happens where there is no egui context.
     pending_theme: Option<Theme>,
@@ -277,6 +279,7 @@ impl ExplorerApp {
             harness_rx: None,
             drag_row: None,
             pending_paste: None,
+            exit_prompt: None,
             marked: BTreeSet::new(),
             anchor_row: None,
             filter: String::new(),
@@ -717,6 +720,69 @@ impl ExplorerApp {
     }
 
     /// The Replace / Skip / Keep both prompt for one colliding destination.
+    /// Refuse a close that would drop unsaved editor buffers, and ask.
+    ///
+    /// The window close button, Alt+F4 and File > Exit all end here, so this
+    /// is the only place the guard has to live. Without it every unsaved
+    /// buffer went out with the process and nothing was said.
+    fn exit_guard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.exit_prompt.is_none() {
+            let dirty = self.editor.dirty_paths();
+            if !dirty.is_empty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.exit_prompt = Some(dirty);
+            }
+        }
+        let Some(dirty) = self.exit_prompt.clone() else { return };
+        let mut decision: Option<&'static str> = None;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("{} file(s) have unsaved changes:", dirty.len()));
+                for p in dirty.iter().take(8) {
+                    ui.small(p.display().to_string());
+                }
+                if dirty.len() > 8 {
+                    ui.small(format!("and {} more", dirty.len() - 8));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save all and exit").clicked() {
+                        decision = Some("save");
+                    }
+                    if ui.button("Discard and exit").clicked() {
+                        decision = Some("discard");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some("cancel");
+                    }
+                });
+            });
+        match decision {
+            Some("save") => {
+                self.editor.save_all(self.cfg.format_json_on_save);
+                let still = self.editor.dirty_paths();
+                if still.is_empty() {
+                    self.exit_prompt = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    // A failed write must not take the file down with the app.
+                    self.exit_prompt = Some(still);
+                    self.status = "Some files could not be saved; exit cancelled".into();
+                }
+            }
+            Some("discard") => {
+                self.exit_prompt = None;
+                self.editor.discard_all_dirty();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some("cancel") => self.exit_prompt = None,
+            _ => {}
+        }
+    }
+
     fn paste_conflict_window(&mut self, ctx: &egui::Context) {
         let Some(p) = &mut self.pending_paste else { return };
         let dst = p.dst.clone();
@@ -934,10 +1000,9 @@ impl ExplorerApp {
             ui.menu_button("Edit", |ui| {
                 ui.small("Text editing undo is Ctrl+Z inside the editor.");
                 if ui.add_enabled(self.body == Body::Ide, egui::Button::new("Format document	Ctrl+Shift+F")).clicked() {
-                    match self.editor.format_active() {
-                        Ok(()) => self.status = "Formatted".into(),
-                        Err(e) => self.status = e,
-                    }
+                    // format_current picks JSON or the language server and
+                    // reports through the editor's own status line.
+                    self.editor.format_current();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -2155,6 +2220,7 @@ impl eframe::App for ExplorerApp {
         if self.harness_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
+        self.exit_guard(ctx);
         self.paste_conflict_window(ctx);
         self.modal_window(ctx);
         self.settings_window(ctx);

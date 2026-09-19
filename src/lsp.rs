@@ -72,11 +72,25 @@ pub struct CompletionItem {
     pub kind: u32,
 }
 
+/// One `textDocument/formatting` edit: replace `[start, end)` with `new_text`.
+/// Positions are zero-based line and UTF-16 column, as the protocol sends
+/// them, matching `Diagnostic`'s convention so the same line/col-to-byte
+/// helper in `editor.rs` converts both.
+#[derive(Clone, Debug)]
+pub struct TextEdit {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub new_text: String,
+}
+
 pub enum LspEvent {
     Initialized,
     Diagnostics { uri: String, items: Vec<Diagnostic> },
     Completion { id: u64, items: Vec<CompletionItem> },
     Hover { id: u64, text: String },
+    Formatting { id: u64, edits: Vec<TextEdit> },
     /// Server exited or the pipe broke.
     Died(String),
     /// Anything routed to the status bar (window/showMessage, logs).
@@ -95,6 +109,11 @@ pub struct LspClient {
     inflight: HashMap<u64, &'static str>,
     #[allow(dead_code)]
     pub name: String,
+    /// From the initialize response's `documentFormattingProvider`. A server
+    /// that never sets this is not going to usefully answer a formatting
+    /// request, so the editor says so up front instead of sending one into
+    /// the void.
+    pub supports_formatting: bool,
 }
 
 impl LspClient {
@@ -155,6 +174,7 @@ impl LspClient {
             pending: Vec::new(),
             inflight: HashMap::new(),
             name: def.command.clone(),
+            supports_formatting: false,
         };
         let root_uri = file_uri(root);
         let id = c.request(
@@ -168,7 +188,8 @@ impl LspClient {
                         "synchronization": {"didSave": true},
                         "completion": {"completionItem": {"snippetSupport": false, "insertReplaceSupport": false}},
                         "hover": {"contentFormat": ["plaintext", "markdown"]},
-                        "publishDiagnostics": {}
+                        "publishDiagnostics": {},
+                        "formatting": {}
                     },
                     "workspace": {"workspaceFolders": true}
                 }
@@ -236,6 +257,22 @@ impl LspClient {
         id
     }
 
+    /// Requests whole-document formatting. Returns the request id; the
+    /// matching `LspEvent::Formatting` carries it. Callers should check
+    /// `supports_formatting` first and say so in the status bar if it is
+    /// false, rather than sending a request the server never advertised.
+    pub fn formatting(&mut self, path: &Path, tab_size: u32, insert_spaces: bool) -> u64 {
+        let id = self.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": file_uri(path)},
+                "options": {"tabSize": tab_size, "insertSpaces": insert_spaces}
+            }),
+        );
+        self.inflight.insert(id, "formatting");
+        id
+    }
+
     /// Drain incoming messages. Call once per frame.
     pub fn poll(&mut self) -> Vec<LspEvent> {
         let mut out = Vec::new();
@@ -266,6 +303,11 @@ impl LspClient {
             if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
                 match self.inflight.remove(&id) {
                     Some("initialize") => {
+                        // `documentFormattingProvider` is either absent/false
+                        // (not supported), `true`, or an options object
+                        // (also support, with options we do not need).
+                        let dfp = &v["result"]["capabilities"]["documentFormattingProvider"];
+                        self.supports_formatting = dfp.as_bool().unwrap_or(!dfp.is_null());
                         self.initialized = true;
                         self.notify("initialized", json!({}));
                         for m in std::mem::take(&mut self.pending) {
@@ -284,6 +326,10 @@ impl LspClient {
                     Some("hover") => {
                         let text = hover_text(&v["result"]["contents"]);
                         out.push(LspEvent::Hover { id, text });
+                    }
+                    Some("formatting") => {
+                        let edits = v["result"].as_array().map(|a| a.iter().map(parse_text_edit).collect()).unwrap_or_default();
+                        out.push(LspEvent::Formatting { id, edits });
                     }
                     _ => {}
                 }
@@ -391,6 +437,17 @@ fn strip_snippet(s: &str) -> String {
         }
     }
     out
+}
+
+/// One `TextEdit` from a `textDocument/formatting` result array.
+fn parse_text_edit(e: &Value) -> TextEdit {
+    TextEdit {
+        start_line: e["range"]["start"]["line"].as_u64().unwrap_or(0) as u32,
+        start_col: e["range"]["start"]["character"].as_u64().unwrap_or(0) as u32,
+        end_line: e["range"]["end"]["line"].as_u64().unwrap_or(0) as u32,
+        end_col: e["range"]["end"]["character"].as_u64().unwrap_or(0) as u32,
+        new_text: e["newText"].as_str().unwrap_or("").to_string(),
+    }
 }
 
 fn hover_text(contents: &Value) -> String {
