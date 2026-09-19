@@ -1257,17 +1257,48 @@ impl ExplorerApp {
         }
     }
 
+    /// Settings in its own OS window, like the agents window, so it can sit
+    /// beside the explorer instead of covering it. Falls back to an in-app
+    /// window on a backend that cannot open a second native one.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
         }
-        let mut open = true;
+        let id = egui::ViewportId::from_hash_of("settings-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Settings")
+            .with_inner_size([640.0, 720.0])
+            .with_min_inner_size([460.0, 400.0])
+            .with_decorations(false);
+        ctx.show_viewport_immediate(id, builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                let mut open = true;
+                egui::Window::new("Settings").open(&mut open).default_width(460.0).show(ctx, |ui| {
+                    self.settings_body(ui);
+                });
+                self.settings_open = open;
+                return;
+            }
+            titlebar::show(ctx, "Settings");
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.settings_body(ui);
+                });
+            });
+            titlebar::resize_handles(ctx);
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.settings_open = false;
+            }
+        });
+    }
+
+    fn settings_body(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let mut changed = false;
         let mut reload = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .default_width(460.0)
-            .show(ctx, |ui| {
+        {
+            {
                 ui.heading("Assistant backend");
                 changed |= ui
                     .radio_value(&mut self.cfg.backend, Backend::ClaudeCode, "Claude Code CLI")
@@ -1332,16 +1363,20 @@ impl ExplorerApp {
                 ui.heading("Language servers");
                 ui.small("Command per file type. Servers start on first open; missing binaries are reported in the status bar.");
                 let mut remove: Option<usize> = None;
-                egui::Grid::new("lsp").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for (i, srv) in self.cfg.lsp_servers.iter_mut().enumerate() {
+                // Plain rows with explicit sizes rather than a Grid: a Grid cell
+                // clamps a TextEdit to the column width it measured last frame, so
+                // `desired_width` is ignored and the fields collapse to a few
+                // characters however wide the window is.
+                for (i, srv) in self.cfg.lsp_servers.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
                         let mut exts = srv.extensions.join(",");
-                        if ui.add(egui::TextEdit::singleline(&mut exts).desired_width(110.0)).changed() {
+                        if ui.add_sized([120.0, 20.0], egui::TextEdit::singleline(&mut exts)).changed() {
                             srv.extensions = exts.split(',').map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
                             changed = true;
                         }
                         let found = lsp::resolve(&srv.command).is_some();
                         let mut cmdline = if srv.args.is_empty() { srv.command.clone() } else { format!("{} {}", srv.command, srv.args.join(" ")) };
-                        if ui.add(egui::TextEdit::singleline(&mut cmdline).desired_width(260.0)).changed() {
+                        if ui.add_sized([300.0, 20.0], egui::TextEdit::singleline(&mut cmdline)).changed() {
                             let mut parts = cmdline.split_whitespace();
                             srv.command = parts.next().unwrap_or("").to_string();
                             srv.args = parts.map(|a| a.to_string()).collect();
@@ -1355,9 +1390,8 @@ impl ExplorerApp {
                         if ui.small_button(icons::CLOSE).clicked() {
                             remove = Some(i);
                         }
-                        ui.end_row();
-                    }
-                });
+                    });
+                }
                 if let Some(i) = remove {
                     self.cfg.lsp_servers.remove(i);
                     changed = true;
@@ -1403,14 +1437,14 @@ impl ExplorerApp {
                     reload = true;
                     changed = true;
                 }
-            });
+            }
+        }
         if reload {
             self.refresh_all();
         }
         if changed {
             self.save_cfg();
         }
-        self.settings_open = open;
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {

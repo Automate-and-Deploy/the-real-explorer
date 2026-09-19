@@ -79,6 +79,8 @@ Dragging out to another application is unavailable on Linux because the crate
 behind it needs a GTK application window that eframe cannot supply; the app
 says so rather than pulling GTK into the build.
 
+![Settings](docs/screenshots/settings.png)
+
 ## Configuration
 
 Global settings live in the platform config directory, for example
