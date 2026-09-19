@@ -696,7 +696,7 @@ fn underline_diagnostics(job: &mut LayoutJob, text: &str, diags: &[Diagnostic]) 
             let mut part = sec.clone();
             part.byte_range = s..e;
             if let Some((_, _, color)) = ranges.iter().find(|(rs, re, _)| s >= *rs && e <= *re) {
-                part.format.underline = egui::Stroke::new(1.5, *color);
+                part.format.underline = egui::Stroke::new(1.5_f32, *color);
             }
             job.sections.push(part);
         }

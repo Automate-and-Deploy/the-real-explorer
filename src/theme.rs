@@ -50,27 +50,27 @@ fn omarchy() -> egui::Style {
     v.extreme_bg_color = bg;
     v.faint_bg_color = Color32::from_rgb(0x1f, 0x20, 0x2e);
     v.selection.bg_fill = select;
-    v.selection.stroke = Stroke::new(1.0, accent);
+    v.selection.stroke = Stroke::new(1.0_f32, accent);
     v.hyperlink_color = accent;
-    v.window_stroke = Stroke::new(1.0, border);
+    v.window_stroke = Stroke::new(1.0_f32, border);
     v.window_rounding = Rounding::ZERO;
     v.menu_rounding = Rounding::ZERO;
 
     v.widgets.noninteractive.bg_fill = panel;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, fg);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, fg);
     v.weak_text_color(); // keep default weak derivation
     let _ = dim;
     v.widgets.inactive.bg_fill = surface;
     v.widgets.inactive.weak_bg_fill = surface;
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, fg);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, fg);
     v.widgets.hovered.bg_fill = select;
     v.widgets.hovered.weak_bg_fill = select;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, fg);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, fg);
     v.widgets.active.bg_fill = accent;
     v.widgets.active.weak_bg_fill = accent;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, fg);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, fg);
     v.widgets.open.bg_fill = surface;
     for w in [
         &mut v.widgets.noninteractive,

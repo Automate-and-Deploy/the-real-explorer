@@ -376,7 +376,7 @@ impl ChatPanel {
                 if zone.dnd_hover_payload::<DragPaths>().is_some() {
                     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("chat_drop")));
                     let stroke = ui.visuals().selection.stroke;
-                    painter.rect_stroke(panel_rect.shrink(2.0), 4.0, egui::Stroke::new(2.0, stroke.color));
+                    painter.rect_stroke(panel_rect.shrink(2.0), 4.0, egui::Stroke::new(2.0_f32, stroke.color));
                     painter.text(
                         panel_rect.center(),
                         egui::Align2::CENTER_CENTER,

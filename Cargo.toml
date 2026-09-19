@@ -15,9 +15,14 @@ ureq = "2"
 egui-phosphor = "0.7"
 url = "2"
 trash = "5"
-drag = "2.1.1"
-clipboard-win = "5.4.1"
 egui_commonmark = "0.18"
+
+# `drag` is the outgoing OS drag source. Its GTK backend wants a
+# `gtk::ApplicationWindow`, which eframe cannot hand it, and it pulls the whole
+# GTK3 development stack into a Linux build for a feature that cannot work
+# there, so it is per-target.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+drag = "2.1.1"
 
 [profile.release]
 opt-level = 3
@@ -42,7 +47,7 @@ allow-downgrades = true
 installer-mode = "currentUser"
 
 [package.metadata.packager.deb]
-depends = ["libgtk-3-0", "libxkbcommon0", "libwayland-client0"]
+depends = ["libgl1", "libxkbcommon0", "libwayland-client0", "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libfontconfig1"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"

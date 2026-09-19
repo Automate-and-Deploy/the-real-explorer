@@ -1462,6 +1462,7 @@ impl ExplorerApp {
     /// runs the platform's own modal drag loop and only returns on drop or
     /// cancel, so the UI stops repainting for the rest of the gesture; the
     /// shell paints the drag image in the meantime.
+    #[cfg(any(windows, target_os = "macos"))]
     fn maybe_hand_drag_to_os(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let Some(payload) = egui::DragAndDrop::payload::<attach::DragPaths>(ctx) else {
             self.os_drag_handed_off = false;
@@ -1505,6 +1506,31 @@ impl ExplorerApp {
         ) {
             Ok(()) => self.status = format!("Dragged {} to another app", names.join(", ")),
             Err(e) => self.status = format!("OS drag failed: {e}"),
+        }
+    }
+}
+
+impl ExplorerApp {
+    /// Linux has no hand-off: the `drag` crate's GTK backend wants a
+    /// `gtk::ApplicationWindow` and eframe cannot supply one, so the drag
+    /// stays internal and the attempt is reported once rather than silently
+    /// doing nothing.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn maybe_hand_drag_to_os(&mut self, ctx: &egui::Context, _frame: &eframe::Frame) {
+        let Some(_p) = egui::DragAndDrop::payload::<attach::DragPaths>(ctx) else {
+            self.os_drag_handed_off = false;
+            return;
+        };
+        if self.os_drag_handed_off {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let (held, outside) = ctx.input(|i| {
+            (i.pointer.primary_down(), i.pointer.latest_pos().map(|p| !screen.contains(p)).unwrap_or(true))
+        });
+        if held && outside {
+            self.os_drag_handed_off = true;
+            self.status = "Dragging to another application is not supported on this platform".into();
         }
     }
 }

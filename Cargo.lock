@@ -3919,7 +3919,6 @@ name = "the-real-explorer"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "clipboard-win",
  "dirs",
  "drag",
  "eframe",
