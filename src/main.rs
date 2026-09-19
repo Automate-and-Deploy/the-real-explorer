@@ -9,12 +9,13 @@
 mod chat;
 mod config;
 mod icons;
+mod platform;
 mod theme;
+mod trash_ops;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use eframe::egui;
@@ -56,6 +57,25 @@ enum SortKey {
     Name,
     Size,
     Modified,
+    Type,
+}
+
+/// Result of the Properties window's background scan.
+struct Props {
+    path: PathBuf,
+    is_dir: bool,
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    /// (bytes, files, folders) once the scan finishes.
+    totals: std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64)>>>,
+}
+
+/// Reversible actions for Ctrl+Z.
+enum Undo {
+    /// (current path, previous path)
+    Rename(PathBuf, PathBuf),
+    /// Original path of an item moved to the recycle bin.
+    Delete(PathBuf),
 }
 
 /// A pending text or confirm dialog.
@@ -88,6 +108,13 @@ struct ExplorerApp {
     /// Internal clipboard: paths and whether the paste should move them.
     clipboard: Option<(Vec<PathBuf>, bool)>,
     modal: Option<Modal>,
+    /// Last undoable action.
+    undo: Option<Undo>,
+    compact: bool,
+    group_by_type: bool,
+    props: Option<Props>,
+    /// Row index the open context menu refers to; None means empty space.
+    menu_row: Option<usize>,
 }
 
 impl ExplorerApp {
@@ -113,6 +140,11 @@ impl ExplorerApp {
             settings_open: false,
             clipboard: None,
             modal: None,
+            undo: None,
+            compact: false,
+            group_by_type: false,
+            props: None,
+            menu_row: None,
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -204,16 +236,26 @@ impl ExplorerApp {
     fn sort_entries(&mut self) {
         let key = self.sort_key;
         let asc = self.sort_asc;
+        let group = self.group_by_type;
         self.entries.sort_by(|a, b| {
             // Folders always first, like Explorer.
             let dir_ord = b.is_dir.cmp(&a.is_dir);
             if dir_ord != std::cmp::Ordering::Equal {
                 return dir_ord;
             }
+            if group {
+                let g = ext_type(&a.name).cmp(&ext_type(&b.name));
+                if g != std::cmp::Ordering::Equal {
+                    return g;
+                }
+            }
             let ord = match key {
                 SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortKey::Size => a.size.cmp(&b.size),
                 SortKey::Modified => a.modified.cmp(&b.modified),
+                SortKey::Type => ext_type(&a.name)
+                    .cmp(&ext_type(&b.name))
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -308,18 +350,89 @@ impl ExplorerApp {
     }
 
     fn open_terminal(&mut self) {
-        let cwd = self.cwd.clone();
-        #[cfg(windows)]
-        let r = Command::new("wt.exe").arg("-d").arg(&cwd).spawn().or_else(|_| {
-            Command::new("cmd").args(["/c", "start", "cmd", "/K"]).current_dir(&cwd).spawn()
-        });
-        #[cfg(target_os = "macos")]
-        let r = Command::new("open").arg("-a").arg("Terminal").arg(&cwd).spawn();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let r = Command::new("x-terminal-emulator").current_dir(&cwd).spawn();
-        if let Err(e) = r {
+        if let Err(e) = platform::open_terminal(&self.cwd) {
             self.status = format!("Terminal failed: {e}");
         }
+    }
+
+    fn open_in_code(&mut self, path: &Path) {
+        if let Err(e) = platform::open_in_code(path) {
+            self.status = format!("VS Code failed: {e}");
+        }
+    }
+
+    fn reveal(&mut self, path: &Path) {
+        if let Err(e) = platform::reveal(path) {
+            self.status = format!("{} failed: {e}", platform::file_manager_name());
+        }
+    }
+
+    fn undo_label(&self) -> &'static str {
+        match self.undo {
+            Some(Undo::Rename(..)) => "Undo Rename	Ctrl+Z",
+            Some(Undo::Delete(..)) => "Undo Delete	Ctrl+Z",
+            None => "Undo	Ctrl+Z",
+        }
+    }
+
+    fn undo(&mut self) {
+        let r = match self.undo.take() {
+            Some(Undo::Rename(cur, prev)) => fs::rename(&cur, &prev)
+                .map(|()| format!("Restored {}", prev.display()))
+                .map_err(|e| e.to_string()),
+            Some(Undo::Delete(orig)) => match trash_ops::restore(&orig) {
+                Ok(true) => Ok(format!("Restored {}", orig.display())),
+                Ok(false) => Err(format!("{} not found in {}", orig.display(), trash_ops::bin_name())),
+                Err(e) => Err(e),
+            },
+            None => return,
+        };
+        match r {
+            Ok(msg) => {
+                self.status = msg;
+                self.refresh_all();
+            }
+            Err(e) => self.status = format!("Undo failed: {e}"),
+        }
+    }
+
+    /// Open the Properties window and start a background size scan.
+    fn show_properties(&mut self, path: PathBuf) {
+        let md = fs::metadata(&path).ok();
+        let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let totals = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let t2 = totals.clone();
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            fn walk(p: &Path, acc: &mut (u64, u64, u64)) {
+                if let Ok(rd) = fs::read_dir(p) {
+                    for de in rd.flatten() {
+                        let Ok(ft) = de.file_type() else { continue };
+                        if ft.is_dir() {
+                            acc.2 += 1;
+                            walk(&de.path(), acc);
+                        } else {
+                            acc.1 += 1;
+                            acc.0 += de.metadata().map(|m| m.len()).unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            let mut acc = (0u64, 0u64, 0u64);
+            if p2.is_dir() {
+                walk(&p2, &mut acc);
+            } else {
+                acc = (fs::metadata(&p2).map(|m| m.len()).unwrap_or(0), 1, 0);
+            }
+            *t2.lock().unwrap() = Some(acc);
+        });
+        self.props = Some(Props {
+            path,
+            is_dir,
+            created: md.as_ref().and_then(|m| m.created().ok()),
+            modified: md.and_then(|m| m.modified().ok()),
+            totals,
+        });
     }
 
     /// Apply a confirmed modal action.
@@ -338,15 +451,13 @@ impl ExplorerApp {
             }
             Modal::Rename { path, name } => {
                 let dst = path.with_file_name(name.trim());
-                fs::rename(&path, &dst).map_err(|e| e.to_string())
+                fs::rename(&path, &dst).map_err(|e| e.to_string()).map(|()| {
+                    self.undo = Some(Undo::Rename(dst, path));
+                })
             }
-            Modal::Delete { path } => {
-                if path.is_dir() {
-                    fs::remove_dir_all(&path).map_err(|e| e.to_string())
-                } else {
-                    fs::remove_file(&path).map_err(|e| e.to_string())
-                }
-            }
+            Modal::Delete { path } => trash_ops::delete_to_trash(&path).map(|()| {
+                self.undo = Some(Undo::Delete(path));
+            }),
         };
         match r {
             Ok(()) => self.refresh_all(),
@@ -383,6 +494,11 @@ impl ExplorerApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.undo.is_some(), egui::Button::new(self.undo_label())).clicked() {
+                    self.undo();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Copy\tCtrl+C")).clicked() {
                     self.copy_selected(false);
                     ui.close_menu();
@@ -548,7 +664,6 @@ impl ExplorerApp {
         let entries = self.entries.clone();
         let mut action: Option<(usize, bool)> = None; // (index, double)
         let mut sort: Option<SortKey> = None;
-        let mut ctx_action: Option<&'static str> = None;
 
         let header = |ui: &mut egui::Ui, title: &str, key: SortKey, app: &Self| -> bool {
             let mark = if app.sort_key == key {
@@ -560,6 +675,8 @@ impl ExplorerApp {
                 .sense(egui::Sense::click()))
                 .clicked()
         };
+
+        let mut hovered_row: Option<usize> = None;
 
         TableBuilder::new(ui)
             .striped(true)
@@ -575,7 +692,7 @@ impl ExplorerApp {
                 h.col(|ui| { ui.strong("Type"); });
             })
             .body(|body| {
-                body.rows(20.0, entries.len(), |mut row| {
+                body.rows(if self.compact { 18.0 } else { 24.0 }, entries.len(), |mut row| {
                     let i = row.index();
                     let e = &entries[i];
                     row.set_selected(self.selected.as_ref() == Some(&e.path));
@@ -600,30 +717,14 @@ impl ExplorerApp {
                         ui.label(if e.is_dir { "Folder".to_string() } else { ext_type(&e.name) });
                     });
                     let r = row.response();
+                    if r.contains_pointer() {
+                        hovered_row = Some(i);
+                    }
                     if r.double_clicked() {
                         action = Some((i, true));
                     } else if r.clicked() {
                         action = Some((i, false));
-                    } else if r.secondary_clicked() {
-                        ctx_action = Some("select");
-                        action = Some((i, false));
                     }
-                    r.context_menu(|ui| {
-                        for (label, key) in [
-                            ("Open", "open"),
-                            ("Copy", "copy"),
-                            ("Cut", "cut"),
-                            ("Rename", "rename"),
-                            ("Delete", "delete"),
-                            ("Copy path", "path"),
-                        ] {
-                            if ui.button(label).clicked() {
-                                action = Some((i, false));
-                                ctx_action = Some(key);
-                                ui.close_menu();
-                            }
-                        }
-                    });
                 });
             });
 
@@ -634,39 +735,241 @@ impl ExplorerApp {
             let e = entries[i].clone();
             self.selected = Some(e.path.clone());
             // Folders open on single left click (tree reveals them); files need a double.
-            if ctx_action.is_none() && (double || e.is_dir) {
+            if double || e.is_dir {
                 self.open_entry(&e);
             }
-            match ctx_action {
-                Some("open") => self.open_entry(&e),
-                Some("copy") => self.copy_selected(false),
-                Some("cut") => self.copy_selected(true),
-                Some("rename") => self.modal = Some(Modal::Rename { path: e.path, name: e.name }),
-                Some("delete") => self.modal = Some(Modal::Delete { path: e.path }),
-                Some("path") => ui.ctx().copy_text(e.path.display().to_string()),
-                _ => {}
+        }
+        // Right-click on empty space: mirrors the Windows 11 Explorer menu.
+        let mut sort: Option<SortKey> = None;
+        let mut asc: Option<bool> = None;
+        // One catch-all interact over the whole pane, registered after the rows so it
+        // is the topmost widget and owns the single context menu. Which items it shows
+        // depends on the row under the pointer when the right button went down.
+        let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), egui::Sense::click());
+        if bg.secondary_clicked() {
+            self.menu_row = hovered_row;
+            if let Some(i) = hovered_row {
+                self.selected = Some(entries[i].path.clone());
             }
         }
-        // Right-click on empty space: paste / new.
-        let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), egui::Sense::click());
+        if let Some(i) = self.menu_row.filter(|i| *i < entries.len()) {
+            let e = entries[i].clone();
+            let mut pick: Option<&'static str> = None;
+            bg.context_menu(|ui| {
+                let reveal_label = if cfg!(windows) {
+                    "Show in Explorer"
+                } else if cfg!(target_os = "macos") {
+                    "Reveal in Finder"
+                } else {
+                    "Show in file manager"
+                };
+                let items: &[(&str, &str)] = &[
+                    ("Open", "open"),
+                    ("Open with Code", "code"),
+                    (reveal_label, "reveal"),
+                    ("", ""),
+                    ("Cut\tCtrl+X", "cut"),
+                    ("Copy\tCtrl+C", "copy"),
+                    ("Copy path", "path"),
+                    ("", ""),
+                    ("Rename\tF2", "rename"),
+                    ("Delete\tDel", "delete"),
+                    ("", ""),
+                    ("Properties\tAlt+Enter", "props"),
+                ];
+                for (label, key) in items {
+                    if label.is_empty() {
+                        ui.separator();
+                    } else if ui.button(*label).clicked() {
+                        pick = Some(key);
+                        ui.close_menu();
+                    }
+                }
+            });
+            match pick {
+                Some("open") => self.open_entry(&e),
+                Some("code") => self.open_in_code(&e.path),
+                Some("reveal") => self.reveal(&e.path),
+                Some("cut") => self.copy_selected(true),
+                Some("copy") => self.copy_selected(false),
+                Some("path") => ui.ctx().copy_text(e.path.display().to_string()),
+                Some("rename") => self.modal = Some(Modal::Rename { path: e.path, name: e.name }),
+                Some("delete") => self.modal = Some(Modal::Delete { path: e.path }),
+                Some("props") => self.show_properties(e.path),
+                _ => {}
+            }
+            return;
+        }
         bg.context_menu(|ui| {
-            if ui.add_enabled(self.clipboard.is_some(), egui::Button::new("Paste")).clicked() {
+            ui.menu_button("View", |ui| {
+                if ui.checkbox(&mut self.compact, "Compact rows").clicked() {
+                    ui.close_menu();
+                }
+                if ui.checkbox(&mut self.show_tree, "Folder tree").clicked() {
+                    ui.close_menu();
+                }
+                if ui.checkbox(&mut self.chat.open, "Assistant panel").clicked() {
+                    self.save_cfg();
+                    ui.close_menu();
+                }
+                if ui.checkbox(&mut self.cfg.show_hidden, "Hidden files").clicked() {
+                    self.refresh_all();
+                    self.save_cfg();
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Sort by", |ui| {
+                for (k, label) in [
+                    (SortKey::Name, "Name"),
+                    (SortKey::Size, "Size"),
+                    (SortKey::Modified, "Date modified"),
+                    (SortKey::Type, "Type"),
+                ] {
+                    if ui.radio(self.sort_key == k, label).clicked() {
+                        sort = Some(k);
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.radio(self.sort_asc, "Ascending").clicked() {
+                    asc = Some(true);
+                    ui.close_menu();
+                }
+                if ui.radio(!self.sort_asc, "Descending").clicked() {
+                    asc = Some(false);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Group by", |ui| {
+                if ui.radio(!self.group_by_type, "None").clicked() {
+                    self.group_by_type = false;
+                    self.sort_entries();
+                    ui.close_menu();
+                }
+                if ui.radio(self.group_by_type, "Type").clicked() {
+                    self.group_by_type = true;
+                    self.sort_entries();
+                    ui.close_menu();
+                }
+            });
+            ui.separator();
+            if ui.add_enabled(self.undo.is_some(), egui::Button::new(self.undo_label())).clicked() {
+                self.undo();
+                ui.close_menu();
+            }
+            if ui.add_enabled(self.clipboard.is_some(), egui::Button::new("Paste\tCtrl+V")).clicked() {
                 self.paste();
                 ui.close_menu();
             }
-            if ui.button("New folder").clicked() {
-                self.modal = Some(Modal::NewFolder { name: "New folder".into() });
+            ui.menu_button("New", |ui| {
+                if ui.button("Folder").clicked() {
+                    self.modal = Some(Modal::NewFolder { name: "New folder".into() });
+                    ui.close_menu();
+                }
+                if ui.button("Text document").clicked() {
+                    self.modal = Some(Modal::NewFile { name: "New Text Document.txt".into() });
+                    ui.close_menu();
+                }
+            });
+            if ui.button("Properties\tAlt+Enter").clicked() {
+                let p = self.cwd.clone();
+                self.show_properties(p);
                 ui.close_menu();
             }
-            if ui.button("New file").clicked() {
-                self.modal = Some(Modal::NewFile { name: "untitled.txt".into() });
-                ui.close_menu();
-            }
-            if ui.button("Open terminal here").clicked() {
+            ui.separator();
+            if ui.button("Open in Terminal").clicked() {
                 self.open_terminal();
                 ui.close_menu();
             }
+            if ui.button("Open with Code").clicked() {
+                let p = self.cwd.clone();
+                self.open_in_code(&p);
+                ui.close_menu();
+            }
+            if ui.button(format!("Open in {}", platform::file_manager_name())).clicked() {
+                let p = self.cwd.clone();
+                self.reveal(&p);
+                ui.close_menu();
+            }
         });
+        if let Some(k) = sort {
+            if self.sort_key != k {
+                self.sort_key = k;
+                self.sort_asc = true;
+                self.sort_entries();
+            }
+        }
+        if let Some(a) = asc {
+            self.sort_asc = a;
+            self.sort_entries();
+        }
+    }
+
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.props else { return };
+        let mut open = true;
+        let name = p
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.path.display().to_string());
+        let totals = *p.totals.lock().unwrap();
+        egui::Window::new(format!("{name} Properties"))
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("props").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Type");
+                    ui.label(if p.is_dir { "Folder".to_string() } else { ext_type(&name) });
+                    ui.end_row();
+                    ui.label("Location");
+                    ui.add(egui::Label::new(p.path.parent().map(|x| x.display().to_string()).unwrap_or_default()).wrap());
+                    ui.end_row();
+                    ui.label("Size");
+                    match totals {
+                        Some((bytes, _, _)) => {
+                            ui.label(format!("{} ({bytes} bytes)", human_size(bytes)));
+                        }
+                        None => {
+                            ui.spinner();
+                        }
+                    }
+                    ui.end_row();
+                    if p.is_dir {
+                        ui.label("Contains");
+                        match totals {
+                            Some((_, files, dirs)) => {
+                                ui.label(format!("{files} files, {dirs} folders"));
+                            }
+                            None => {
+                                ui.label("scanning");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                    ui.label("Created");
+                    ui.label(p.created.map(fmt_time).unwrap_or_default());
+                    ui.end_row();
+                    ui.label("Modified");
+                    ui.label(p.modified.map(fmt_time).unwrap_or_default());
+                    ui.end_row();
+                });
+                if totals.is_none() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Copy path").clicked() {
+                        ctx.copy_text(p.path.display().to_string());
+                    }
+                    if cfg!(windows) && ui.button("Windows properties").clicked() {
+                        let _ = platform::native_properties(&p.path);
+                    }
+                });
+            });
+        if !open {
+            self.props = None;
+        }
     }
 
     fn modal_window(&mut self, ctx: &egui::Context) {
@@ -693,8 +996,7 @@ impl ExplorerApp {
                         }
                     }
                     Modal::Delete { path } => {
-                        ui.label(format!("Permanently delete {}?", path.display()));
-                        ui.small("This does not go to the recycle bin.");
+                        ui.label(format!("Move {} to the {}?", path.display(), trash_ops::bin_name()));
                     }
                 }
                 ui.horizontal(|ui| {
@@ -833,7 +1135,7 @@ impl ExplorerApp {
         if i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight) {
             self.go_forward();
         }
-        if i.key_pressed(egui::Key::Enter) {
+        if i.key_pressed(egui::Key::Enter) && !i.modifiers.alt {
             if let Some(e) = self.selected_entry() {
                 self.open_entry(&e);
             }
@@ -865,6 +1167,13 @@ impl ExplorerApp {
         }
         if cmd && i.key_pressed(egui::Key::Comma) {
             self.settings_open = true;
+        }
+        if cmd && i.key_pressed(egui::Key::Z) {
+            self.undo();
+        }
+        if i.modifiers.alt && i.key_pressed(egui::Key::Enter) {
+            let p = self.selected.clone().unwrap_or_else(|| self.cwd.clone());
+            self.show_properties(p);
         }
     }
 }
@@ -900,6 +1209,7 @@ impl eframe::App for ExplorerApp {
 
         self.modal_window(ctx);
         self.settings_window(ctx);
+        self.properties_window(ctx);
     }
 }
 

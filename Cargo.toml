@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 dirs = "5"
 ureq = "2"
 egui-phosphor = "0.7"
+trash = "5"
 
 [profile.release]
 opt-level = 3
