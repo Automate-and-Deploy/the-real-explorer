@@ -6,9 +6,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod attach;
 mod chat;
 mod config;
 mod editor;
+mod harness;
 mod icons;
 mod lsp;
 mod platform;
@@ -670,6 +672,8 @@ impl ExplorerApp {
     }
 
     fn tree_panel(&mut self, ui: &mut egui::Ui) {
+        // Labels here are navigation, not prose; a drag must not sweep a text selection.
+        ui.style_mut().interaction.selectable_labels = false;
         egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
             let roots = self.roots.clone();
             for root in roots {
@@ -709,7 +713,8 @@ impl ExplorerApp {
             job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
             let name_color = if is_cwd { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
             job.append(&label, 0.0, egui::TextFormat { font_id: font, color: name_color, ..Default::default() });
-            let resp = ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate());
+            let resp = ui.add(egui::Label::new(job).sense(egui::Sense::click_and_drag()).truncate());
+            resp.dnd_set_drag_payload(attach::DragPaths(vec![dir.to_path_buf()]));
             if resp.clicked() {
                 self.expanded.insert(dir.to_path_buf());
                 self.navigate(dir.to_path_buf());
@@ -734,7 +739,9 @@ impl ExplorerApp {
                         job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
                         let name_color = if is_active { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
                         job.append(&name, 0.0, egui::TextFormat { font_id: font, color: name_color, ..Default::default() });
-                        if ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate()).clicked() {
+                        let r = ui.add(egui::Label::new(job).sense(egui::Sense::click_and_drag()).truncate());
+                        r.dnd_set_drag_payload(attach::DragPaths(vec![file.clone()]));
+                        if r.clicked() {
                             self.open_in_ide(&file);
                         }
                     });
@@ -744,6 +751,7 @@ impl ExplorerApp {
     }
 
     fn details_panel(&mut self, ui: &mut egui::Ui) {
+        ui.style_mut().interaction.selectable_labels = false;
         let entries = self.entries.clone();
         let mut action: Option<(usize, bool)> = None; // (index, double)
         let mut sort: Option<SortKey> = None;
@@ -1315,6 +1323,7 @@ impl eframe::App for ExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
 
+        drag_preview(ctx);
         titlebar::show(ctx, "The Real Explorer");
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ctx, ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1371,6 +1380,22 @@ impl eframe::App for ExplorerApp {
         self.properties_window(ctx);
         titlebar::resize_handles(ctx);
     }
+}
+
+/// Follow the cursor with the dragged item's name while a drag is in flight.
+fn drag_preview(ctx: &egui::Context) {
+    let Some(p) = egui::DragAndDrop::payload::<attach::DragPaths>(ctx) else { return };
+    let Some(pos) = ctx.pointer_interact_pos() else { return };
+    let text = match p.0.as_slice() {
+        [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| one.display().to_string()),
+        many => format!("{} items", many.len()),
+    };
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_preview")));
+    let font = egui::FontId::proportional(13.0);
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+    let rect = egui::Rect::from_min_size(pos + egui::vec2(12.0, 12.0), galley.size() + egui::vec2(12.0, 6.0));
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(200));
+    painter.galley(rect.min + egui::vec2(6.0, 3.0), galley, egui::Color32::WHITE);
 }
 
 // ---------- helpers ----------

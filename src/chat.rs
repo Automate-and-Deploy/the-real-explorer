@@ -18,6 +18,7 @@ use std::thread;
 use eframe::egui;
 use serde_json::{json, Value};
 
+use crate::attach::{self, Attachment, DragPaths};
 use crate::config::{Backend, Config};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,6 +44,10 @@ enum Event {
 
 pub struct ChatPanel {
     pub open: bool,
+    /// Dropped paths waiting for the next send. Cleared on send.
+    attachments: Vec<Attachment>,
+    /// Last refusal or dedupe note, shown under the chips.
+    attach_note: String,
     input: String,
     messages: Vec<ChatMsg>,
     session_id: Option<String>,
@@ -54,6 +59,8 @@ impl ChatPanel {
     pub fn new(open: bool) -> Self {
         Self {
             open,
+            attachments: Vec::new(),
+            attach_note: String::new(),
             input: String::new(),
             messages: Vec::new(),
             session_id: None,
@@ -67,6 +74,22 @@ impl ChatPanel {
         self.messages.clear();
     }
 
+    /// Add a dropped path as a chip. Refuses non-UTF-8 paths and duplicates,
+    /// and says so in `attach_note` rather than silently.
+    pub fn attach(&mut self, path: &std::path::Path) {
+        if self.attachments.iter().any(|a| a.path == path) {
+            self.attach_note = format!("already attached: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            return;
+        }
+        match Attachment::from_path(path) {
+            Ok(a) => {
+                self.attach_note.clear();
+                self.attachments.push(a);
+            }
+            Err(e) => self.attach_note = format!("not attached: {e}"),
+        }
+    }
+
     fn send(&mut self, prompt: String, cwd: PathBuf, cfg: &Config) {
         // Snapshot history before pushing, for the OpenAI backend.
         let history: Vec<Value> = self
@@ -76,7 +99,15 @@ impl ChatPanel {
             .map(|m| json!({"role": if m.role == Role::User {"user"} else {"assistant"}, "content": m.text}))
             .collect();
 
-        self.messages.push(ChatMsg { role: Role::User, text: prompt.clone() });
+        let atts = std::mem::take(&mut self.attachments);
+        self.attach_note.clear();
+        let shown = if atts.is_empty() {
+            prompt.clone()
+        } else {
+            let names: Vec<String> = atts.iter().map(|a| a.name()).collect();
+            format!("{prompt}\n\nattached: {}", names.join(", "))
+        };
+        self.messages.push(ChatMsg { role: Role::User, text: shown });
         self.messages.push(ChatMsg { role: Role::Assistant, text: String::new() });
         self.busy = true;
         let (tx, rx) = channel();
@@ -86,11 +117,19 @@ impl ChatPanel {
             Backend::ClaudeCode => {
                 let resume = self.session_id.clone();
                 let mode = cfg.claude_permission_mode.clone();
-                thread::spawn(move || run_claude(tx, prompt, cwd, resume, mode));
+                let full = attach::claude_block(&atts, &prompt);
+                thread::spawn(move || run_claude(tx, full, cwd, resume, mode));
             }
             Backend::OpenAiCompatible => {
                 let cfg = cfg.clone();
-                thread::spawn(move || run_openai(tx, prompt, cwd, history, cfg));
+                thread::spawn(move || {
+                    // Contents are read here, off the UI thread, at send time.
+                    let (full, notices) = attach::openai_block(&atts, &prompt);
+                    for n in notices {
+                        let _ = tx.send(Event::Tool(format!("attachment: {n}")));
+                    }
+                    run_openai(tx, full, cwd, history, cfg)
+                });
             }
         }
     }
@@ -138,6 +177,7 @@ impl ChatPanel {
             .default_width(380.0)
             .min_width(240.0)
             .show(ctx, |ui| {
+                let panel_rect = ui.max_rect();
                 ui.horizontal(|ui| {
                     ui.strong(title);
                     if self.busy {
@@ -179,12 +219,22 @@ impl ChatPanel {
                     });
 
                 ui.separator();
+                self.chips(ui, cfg);
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text("Ask about this folder. Enter sends, Shift+Enter newline."),
                 );
+                // Backspace in an empty input removes the last chip; Escape clears them.
+                if resp.has_focus() && self.input.is_empty() && !self.attachments.is_empty() {
+                    if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
+                        self.attachments.pop();
+                    }
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        self.attachments.clear();
+                    }
+                }
                 let enter = resp.has_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();
@@ -193,7 +243,77 @@ impl ChatPanel {
                     self.input.clear();
                     self.send(prompt, cwd.clone(), cfg);
                 }
+
+                // Drop zone: a hover-only interact over the whole panel, registered last.
+                // `Ui::dnd_drop_zone` was rejected because it repaints the frame fill every
+                // frame; hover sense steals no clicks from the TextEdit or buttons, and the
+                // dnd_* payload calls gate on contains_pointer, so they work under widgets.
+                let zone = ui.interact(panel_rect, ui.id().with("dropzone"), egui::Sense::hover());
+                if zone.dnd_hover_payload::<DragPaths>().is_some() {
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("chat_drop")));
+                    let stroke = ui.visuals().selection.stroke;
+                    painter.rect_stroke(panel_rect.shrink(2.0), 4.0, egui::Stroke::new(2.0, stroke.color));
+                    painter.text(
+                        panel_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drop to attach",
+                        egui::FontId::proportional(18.0),
+                        stroke.color,
+                    );
+                }
+                if let Some(p) = zone.dnd_release_payload::<DragPaths>() {
+                    for path in &p.0 {
+                        self.attach(path);
+                    }
+                }
             });
+    }
+
+    /// Attachment chips above the input: icon, name, size, remove button.
+    fn chips(&mut self, ui: &mut egui::Ui, cfg: &Config) {
+        if self.attachments.is_empty() && self.attach_note.is_empty() {
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        let openai = cfg.backend == Backend::OpenAiCompatible;
+        ui.horizontal_wrapped(|ui| {
+            for (i, a) in self.attachments.iter().enumerate() {
+                let (glyph, color) = match a.kind {
+                    attach::Kind::Folder => crate::icons::folder(false),
+                    _ => crate::icons::file(&a.name()),
+                };
+                let cut = openai && a.will_be_cut();
+                let text_color = if cut { ui.visuals().warn_fg_color } else { ui.visuals().text_color() };
+                let label = match a.kind {
+                    attach::Kind::Folder => a.name(),
+                    attach::Kind::Binary => format!("{} (binary)", a.name()),
+                    attach::Kind::Text => format!("{} ({})", a.name(), attach::human(a.size)),
+                };
+                egui::Frame::group(ui.style()).inner_margin(egui::vec2(6.0, 2.0)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(egui::RichText::new(glyph).color(crate::icons::tint(color, ui.visuals().dark_mode)));
+                    let r = ui.label(egui::RichText::new(label).color(text_color).small());
+                    let tip = if cut {
+                        format!("{}\nwill be cut or skipped on this backend", a.path.display())
+                    } else {
+                        a.path.display().to_string()
+                    };
+                    r.on_hover_text(tip);
+                    if ui.small_button(crate::icons::CLOSE).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if self.attachments.len() > 1 && ui.small_button("Clear").clicked() {
+                self.attachments.clear();
+            }
+        });
+        if let Some(i) = remove {
+            self.attachments.remove(i);
+        }
+        if !self.attach_note.is_empty() {
+            ui.small(&self.attach_note);
+        }
     }
 }
 
