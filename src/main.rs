@@ -8,7 +8,9 @@
 
 mod chat;
 mod config;
+mod editor;
 mod icons;
+mod lsp;
 mod platform;
 mod theme;
 mod trash_ops;
@@ -78,6 +80,13 @@ enum Undo {
     Delete(PathBuf),
 }
 
+/// Which view the centre panel shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Body {
+    Explorer,
+    Ide,
+}
+
 /// A pending text or confirm dialog.
 enum Modal {
     NewFolder { name: String },
@@ -115,6 +124,8 @@ struct ExplorerApp {
     props: Option<Props>,
     /// Row index the open context menu refers to; None means empty space.
     menu_row: Option<usize>,
+    body: Body,
+    editor: editor::Editor,
 }
 
 impl ExplorerApp {
@@ -145,6 +156,8 @@ impl ExplorerApp {
             group_by_type: false,
             props: None,
             menu_row: None,
+            body: Body::Explorer,
+            editor: editor::Editor::new(),
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -309,7 +322,19 @@ impl ExplorerApp {
     fn open_entry(&mut self, e: &Entry) {
         if e.is_dir {
             self.navigate(e.path.clone());
-        } else if let Err(err) = open::that_detached(&e.path) {
+        } else {
+            self.open_in_ide(&e.path);
+        }
+    }
+
+    fn open_in_ide(&mut self, path: &Path) {
+        let root = self.cwd.clone();
+        self.editor.open(path, &root, &self.cfg.lsp_servers);
+        self.body = Body::Ide;
+    }
+
+    fn open_with_system(&mut self, path: &Path) {
+        if let Err(err) = open::that_detached(path) {
             self.status = format!("Open failed: {err}");
         }
     }
@@ -720,24 +745,11 @@ impl ExplorerApp {
                     if r.contains_pointer() {
                         hovered_row = Some(i);
                     }
-                    if r.double_clicked() {
-                        action = Some((i, true));
-                    } else if r.clicked() {
-                        action = Some((i, false));
-                    }
                 });
             });
 
         if let Some(k) = sort {
             self.toggle_sort(k);
-        }
-        if let Some((i, double)) = action {
-            let e = entries[i].clone();
-            self.selected = Some(e.path.clone());
-            // Folders open on single left click (tree reveals them); files need a double.
-            if double || e.is_dir {
-                self.open_entry(&e);
-            }
         }
         // Right-click on empty space: mirrors the Windows 11 Explorer menu.
         let mut sort: Option<SortKey> = None;
@@ -746,10 +758,25 @@ impl ExplorerApp {
         // is the topmost widget and owns the single context menu. Which items it shows
         // depends on the row under the pointer when the right button went down.
         let bg = ui.interact(ui.max_rect(), ui.id().with("bg"), egui::Sense::click());
+        if let Some(i) = hovered_row {
+            if bg.double_clicked() {
+                action = Some((i, true));
+            } else if bg.clicked() {
+                action = Some((i, false));
+            }
+        }
         if bg.secondary_clicked() {
             self.menu_row = hovered_row;
             if let Some(i) = hovered_row {
                 self.selected = Some(entries[i].path.clone());
+            }
+        }
+        if let Some((i, double)) = action {
+            let e = entries[i].clone();
+            self.selected = Some(e.path.clone());
+            // Folders open on single left click (tree reveals them); files need a double.
+            if double || e.is_dir {
+                self.open_entry(&e);
             }
         }
         if let Some(i) = self.menu_row.filter(|i| *i < entries.len()) {
@@ -765,6 +792,7 @@ impl ExplorerApp {
                 };
                 let items: &[(&str, &str)] = &[
                     ("Open", "open"),
+                    ("Open with default app", "system"),
                     ("Open with Code", "code"),
                     (reveal_label, "reveal"),
                     ("", ""),
@@ -788,6 +816,7 @@ impl ExplorerApp {
             });
             match pick {
                 Some("open") => self.open_entry(&e),
+                Some("system") => self.open_with_system(&e.path),
                 Some("code") => self.open_in_code(&e.path),
                 Some("reveal") => self.reveal(&e.path),
                 Some("cut") => self.copy_selected(true),
@@ -1090,6 +1119,49 @@ impl ExplorerApp {
                     }
                 }
                 ui.add_space(8.0);
+                ui.heading("Language servers");
+                ui.small("Command per file type. Servers start on first open; missing binaries are reported in the status bar.");
+                let mut remove: Option<usize> = None;
+                egui::Grid::new("lsp").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                    for (i, srv) in self.cfg.lsp_servers.iter_mut().enumerate() {
+                        let mut exts = srv.extensions.join(",");
+                        if ui.add(egui::TextEdit::singleline(&mut exts).desired_width(110.0)).changed() {
+                            srv.extensions = exts.split(',').map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+                            changed = true;
+                        }
+                        let mut cmdline = if srv.args.is_empty() { srv.command.clone() } else { format!("{} {}", srv.command, srv.args.join(" ")) };
+                        if ui.add(egui::TextEdit::singleline(&mut cmdline).desired_width(260.0)).changed() {
+                            let mut parts = cmdline.split_whitespace();
+                            srv.command = parts.next().unwrap_or("").to_string();
+                            srv.args = parts.map(|a| a.to_string()).collect();
+                            changed = true;
+                        }
+                        if ui.small_button(icons::CLOSE).clicked() {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+                if let Some(i) = remove {
+                    self.cfg.lsp_servers.remove(i);
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Add").clicked() {
+                        self.cfg.lsp_servers.push(lsp::ServerDef {
+                            extensions: vec!["ext".into()],
+                            language_id: "plaintext".into(),
+                            command: "server".into(),
+                            args: vec![],
+                        });
+                        changed = true;
+                    }
+                    if ui.small_button("Reset defaults").clicked() {
+                        self.cfg.lsp_servers = lsp::default_servers();
+                        changed = true;
+                    }
+                });
+                ui.add_space(8.0);
                 ui.heading("Appearance");
                 ui.horizontal(|ui| {
                     for (t, label) in [
@@ -1205,7 +1277,32 @@ impl eframe::App for ExplorerApp {
         if was_open != self.chat.open {
             self.save_cfg();
         }
-        egui::CentralPanel::default().show(ctx, |ui| self.details_panel(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(self.body == Body::Explorer, format!("{} Explorer", icons::EXPLORER)).clicked() {
+                    self.body = Body::Explorer;
+                }
+                let ide_label = if self.editor.docs.iter().any(|d| d.dirty) {
+                    format!("{} IDE •", icons::IDE)
+                } else {
+                    format!("{} IDE", icons::IDE)
+                };
+                if ui.selectable_label(self.body == Body::Ide, ide_label).clicked() {
+                    self.body = Body::Ide;
+                }
+            });
+            ui.separator();
+            match self.body {
+                Body::Explorer => self.details_panel(ui),
+                Body::Ide => {
+                    let servers = self.cfg.lsp_servers.clone();
+                    self.editor.show(ui, &servers);
+                    if !self.editor.status.is_empty() {
+                        self.status = std::mem::take(&mut self.editor.status);
+                    }
+                }
+            }
+        });
 
         self.modal_window(ctx);
         self.settings_window(ctx);

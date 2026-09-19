@@ -34,6 +34,8 @@ pub struct Config {
     pub theme: Theme,
     pub show_hidden: bool,
     pub chat_open: bool,
+    #[serde(default = "crate::lsp::default_servers")]
+    pub lsp_servers: Vec<crate::lsp::ServerDef>,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             theme: Theme::System,
             show_hidden: false,
             chat_open: true,
+            lsp_servers: crate::lsp::default_servers(),
         }
     }
 }
