@@ -8,6 +8,7 @@ eframe = "0.29"
 egui_extras = "0.29"
 open = "5"
 chrono = "0.4"
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

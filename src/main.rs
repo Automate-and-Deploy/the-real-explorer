@@ -9,6 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod chat;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -62,6 +64,7 @@ struct ExplorerApp {
     roots: Vec<PathBuf>,
     show_hidden: bool,
     status: String,
+    chat: chat::ChatPanel,
 }
 
 impl ExplorerApp {
@@ -81,6 +84,7 @@ impl ExplorerApp {
             roots: drive_roots(),
             show_hidden: false,
             status: String::new(),
+            chat: chat::ChatPanel::new(),
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -246,7 +250,7 @@ impl ExplorerApp {
             }
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.address)
-                    .desired_width(ui.available_width() - 110.0),
+                    .desired_width(ui.available_width() - 170.0),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let p = PathBuf::from(self.address.trim());
@@ -255,6 +259,9 @@ impl ExplorerApp {
             if ui.checkbox(&mut self.show_hidden, "Hidden").changed() {
                 self.tree_children.clear();
                 self.reload();
+            }
+            if ui.selectable_label(self.chat.open, "Chat").clicked() {
+                self.chat.open = !self.chat.open;
             }
         });
     }
@@ -367,7 +374,8 @@ impl ExplorerApp {
         if let Some((i, double)) = action {
             let e = entries[i].clone();
             self.selected = Some(e.path.clone());
-            if double {
+            // Folders open on single click (tree reveals them); files need a double.
+            if double || e.is_dir {
                 self.open_entry(&e);
             }
         }
@@ -412,6 +420,8 @@ impl eframe::App for ExplorerApp {
             .default_width(260.0)
             .min_width(140.0)
             .show(ctx, |ui| self.tree_panel(ui));
+        let cwd = self.cwd.clone();
+        self.chat.show(ctx, &cwd);
         egui::CentralPanel::default().show(ctx, |ui| self.details_panel(ui));
     }
 }
