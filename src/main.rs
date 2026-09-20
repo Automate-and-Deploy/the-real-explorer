@@ -16,6 +16,7 @@ mod hooks;
 mod hooks_ui;
 mod icons;
 mod lsp;
+mod meta;
 mod platform;
 mod textpos;
 mod theme;

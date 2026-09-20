@@ -27,6 +27,12 @@ egui_commonmark = "0.18"
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 drag = "2.1.1"
 
+# `SetFileAttributesW`, to re-hide the notes sidecar after every save. std can
+# only toggle the read-only bit, and tmp+rename lands a new file with none of
+# the old one's attributes, so this is needed on each write, not once.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [profile.release]
 opt-level = 3
 strip = true
