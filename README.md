@@ -223,6 +223,13 @@ writes the current settings there.
 An API key for an OpenAI-compatible endpoint is stored in that config file in
 plain text.
 
+Notes and tags you put on a file or folder are kept in a hidden
+`.folder-meta.json` in the folder that holds it, keyed by name. They travel
+with that folder into any copy, zip, share or repository, and they are plain
+text, so a note in a folder you publish is published with it. Renaming an item
+in place keeps its note; moving it to a different parent folder leaves the note
+behind. A note is matched by the filter box alongside the name.
+
 ## Themes
 
 System, light, dark, and Omarchy, which is the Tokyo Night palette in
@@ -241,7 +248,8 @@ cargo test
 
 The test suite covers the attachment size caps, the trash operations including
 a restore round trip, the hooks round trip and the hook runner, the agent and
-skill discovery, the JSON diagnostics, and a live rust-analyzer session.
+skill discovery, the JSON diagnostics, the notes sidecar including the hidden attribute
+surviving a second save on Windows, and a live rust-analyzer session.
 
 ## Licence
 

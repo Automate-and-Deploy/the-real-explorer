@@ -17,13 +17,14 @@ mod hooks;
 mod hooks_ui;
 mod icons;
 mod lsp;
+mod meta;
 mod platform;
 mod textpos;
 mod theme;
 mod titlebar;
 mod trash_ops;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -81,6 +82,10 @@ struct Entry {
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    /// Note from this folder's `.folder-meta.json`, empty when there is none.
+    note: String,
+    /// Tags from the same place, already lowercased.
+    tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -111,7 +116,7 @@ impl SortKey {
     }
 }
 
-/// Result of the Properties window's background scan.
+/// Result of the Properties window's background scan, and the note editor.
 struct Props {
     path: PathBuf,
     is_dir: bool,
@@ -119,6 +124,17 @@ struct Props {
     modified: Option<SystemTime>,
     /// (bytes, files, folders) once the scan finishes.
     totals: std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64)>>>,
+    /// The folder whose sidecar holds this item's note, and the name it is
+    /// keyed by. `None` for a drive root, which has no parent to hold one.
+    home: Option<(PathBuf, String)>,
+    /// Note as typed. Saved on Save, never per keystroke.
+    note: String,
+    /// Tags as typed, comma separated.
+    tags: String,
+    /// `(note, tags)` as loaded, for Revert and for spotting an unsaved edit.
+    loaded: (String, String),
+    /// The sidecar was written by a newer build: shown, never written over.
+    read_only: bool,
 }
 
 /// Reversible actions for Ctrl+Z.
@@ -227,6 +243,16 @@ struct ExplorerApp {
     filter_focus: bool,
     /// Set when the selection moved by keyboard, so the list scrolls to it.
     scroll_to_selection: bool,
+    /// Parsed notes sidecar for `meta_dir`. `reload()` runs on every filter
+    /// keystroke, so the file is read once per folder and not once per key.
+    meta: Option<meta::FolderMeta>,
+    /// Folder `meta` was read from. `None` forces the next `reload()` to read
+    /// again; that is how F5 and a save invalidate the cache.
+    meta_dir: Option<PathBuf>,
+    /// Why the sidecar could not be read, if it could not. Repeated on the
+    /// status line rather than swallowed, because the alternative is a folder
+    /// whose notes have silently vanished.
+    meta_error: Option<String>,
 }
 
 impl ExplorerApp {
@@ -287,6 +313,9 @@ impl ExplorerApp {
             filter: String::new(),
             filter_focus: false,
             scroll_to_selection: false,
+            meta: None,
+            meta_dir: None,
+            meta_error: None,
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -415,8 +444,44 @@ impl ExplorerApp {
         }
     }
 
+    /// Read the notes sidecar for the current folder unless it is already
+    /// cached. Called from `reload()`, which runs on every filter keystroke.
+    fn load_meta(&mut self) {
+        if self.meta_dir.as_deref() == Some(self.cwd.as_path()) {
+            return;
+        }
+        match meta::load(&self.cwd) {
+            Ok(m) => {
+                self.meta = m;
+                self.meta_error = None;
+            }
+            Err(e) => {
+                self.meta = None;
+                self.meta_error = Some(e);
+            }
+        }
+        self.meta_dir = Some(self.cwd.clone());
+    }
+
+    /// Forget the cached sidecar, so the next `reload()` re-reads it.
+    fn invalidate_meta(&mut self) {
+        self.meta_dir = None;
+    }
+
+    /// True when this folder has at least one annotated entry, which is what
+    /// decides whether the details list shows a Note column at all. Read from
+    /// the sidecar rather than from `entries` so the column does not appear
+    /// and disappear as the filter narrows the list.
+    fn has_notes(&self) -> bool {
+        self.meta
+            .as_ref()
+            .map(|m| m.items.values().any(|i| !i.note.is_empty() || !i.tags.is_empty()))
+            .unwrap_or(false)
+    }
+
     /// Re-read the current directory into `entries` and sort.
     fn reload(&mut self) {
+        self.load_meta();
         self.entries.clear();
         match fs::read_dir(&self.cwd) {
             Ok(rd) => {
@@ -426,19 +491,28 @@ impl ExplorerApp {
                         continue;
                     }
                     let md = de.metadata().ok();
+                    let item = self.meta.as_ref().and_then(|m| m.items.get(&name));
                     self.entries.push(Entry {
                         name,
                         path: de.path(),
                         is_dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
                         size: md.as_ref().map(|m| m.len()).unwrap_or(0),
                         modified: md.and_then(|m| m.modified().ok()),
+                        note: item.map(|i| i.note.clone()).unwrap_or_default(),
+                        tags: item.map(|i| i.tags.clone()).unwrap_or_default(),
                     });
                 }
                 if !self.filter.is_empty() {
+                    // Name, note or any tag: typing "tax" finds both the file
+                    // called tax and the one you annotated with it. Lowercase
+                    // the needle once here rather than once per row.
                     let needle = self.filter.to_lowercase();
-                    self.entries.retain(|e| e.name.to_lowercase().contains(&needle));
+                    self.entries.retain(|e| meta::matches(&needle, &e.name, &e.note, &e.tags));
                 }
-                self.status = format!("{} items", self.entries.len());
+                self.status = match &self.meta_error {
+                    Some(e) => format!("{} items — {e}", self.entries.len()),
+                    None => format!("{} items", self.entries.len()),
+                };
             }
             Err(e) => self.status = format!("Cannot read {}: {e}", self.cwd.display()),
         }
@@ -452,9 +526,12 @@ impl ExplorerApp {
     }
 
     /// Reload the list and drop the tree cache so new or renamed folders show.
+    /// This is F5, and F5 is what the user presses after editing a sidecar by
+    /// hand, so the notes cache goes too.
     fn refresh_all(&mut self) {
         self.tree_children.clear();
         self.tree_files.clear();
+        self.invalidate_meta();
         self.reload();
     }
 
@@ -684,8 +761,10 @@ impl ExplorerApp {
             };
             let mut dst = self.cwd.join(name);
             // Pasting into the source folder is a duplicate, not a collision.
+            let mut duplicate = false;
             if dst == src {
                 dst = unique_name(&dst);
+                duplicate = true;
             } else if dst.exists() {
                 match policy {
                     Collision::Ask => {
@@ -718,6 +797,9 @@ impl ExplorerApp {
                 self.status = format!("Paste failed: {e}");
                 self.refresh_all();
                 return;
+            }
+            if duplicate {
+                self.meta_copy(&src, &dst);
             }
             done += 1;
         }
@@ -866,9 +948,15 @@ impl ExplorerApp {
 
     fn undo(&mut self) {
         let r = match self.undo.take() {
-            Some(Undo::Rename(cur, prev)) => fs::rename(&cur, &prev)
-                .map(|()| format!("Restored {}", prev.display()))
-                .map_err(|e| e.to_string()),
+            Some(Undo::Rename(cur, prev)) => match fs::rename(&cur, &prev) {
+                Ok(()) => {
+                    // Undoing a rename is a rename, and the note follows it
+                    // back the same way it followed it out.
+                    self.meta_rename(&cur, &prev);
+                    Ok(format!("Restored {}", prev.display()))
+                }
+                Err(e) => Err(e.to_string()),
+            },
             Some(Undo::Delete(orig)) => match trash_ops::restore(&orig) {
                 Ok(true) => Ok(format!("Restored {}", orig.display())),
                 Ok(false) => Err(format!("{} not found in {}", orig.display(), trash_ops::bin_name())),
@@ -915,13 +1003,181 @@ impl ExplorerApp {
             }
             *t2.lock().unwrap() = Some(acc);
         });
+        // The note lives in the parent folder's sidecar under this name, so
+        // the window reads it from there rather than from the cached listing:
+        // Properties is reachable from the tree and from the address bar too,
+        // where the item is not a row in the current folder at all.
+        let home = path
+            .parent()
+            .zip(path.file_name())
+            .map(|(d, n)| (d.to_path_buf(), n.to_string_lossy().into_owned()));
+        let mut note = String::new();
+        let mut tags = String::new();
+        let mut read_only = false;
+        if let Some((dir, key)) = &home {
+            match meta::load(dir) {
+                Ok(Some(m)) => {
+                    read_only = m.is_read_only();
+                    if let Some(i) = m.items.get(key) {
+                        note = i.note.clone();
+                        tags = meta::tags_line(&i.tags);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.status = e,
+            }
+        }
         self.props = Some(Props {
             path,
             is_dir,
             created: md.as_ref().and_then(|m| m.created().ok()),
             modified: md.and_then(|m| m.modified().ok()),
             totals,
+            home,
+            loaded: (note.clone(), tags.clone()),
+            note,
+            tags,
+            read_only,
         });
+    }
+
+    /// Load the sidecar for `dir`, let `edit` change it, and write it back
+    /// when `edit` reports a change.
+    ///
+    /// Entries whose name is no longer in the folder are dropped at the same
+    /// time, but only when the folder could actually be listed: pruning
+    /// against a transient read error would delete every note in it.
+    ///
+    /// `create` is false for the rename, delete and paste hooks. Renaming a
+    /// file in a folder nobody has annotated must not conjure a sidecar into
+    /// it, and it must not cost a write either.
+    fn edit_meta(
+        &mut self,
+        dir: &Path,
+        create: bool,
+        edit: impl FnOnce(&mut meta::FolderMeta) -> bool,
+    ) -> Result<bool, String> {
+        let mut m = match meta::load(dir)? {
+            Some(m) => m,
+            None if create => meta::FolderMeta::default(),
+            None => return Ok(false),
+        };
+        if !edit(&mut m) {
+            return Ok(false);
+        }
+        if let Ok(rd) = fs::read_dir(dir) {
+            let present: HashSet<String> =
+                rd.flatten().map(|de| de.file_name().to_string_lossy().into_owned()).collect();
+            m.prune(&present);
+        }
+        meta::save(dir, &m)?;
+        self.invalidate_meta();
+        Ok(true)
+    }
+
+    /// Move an entry's note with the file after a rename in place.
+    ///
+    /// A rename that lands in a different folder is a move, and a note stays
+    /// in the folder that holds it, so nothing is carried across.
+    fn meta_rename(&mut self, from: &Path, to: &Path) {
+        let (Some(dir), Some(old), Some(new)) = (from.parent(), from.file_name(), to.file_name()) else {
+            return;
+        };
+        if to.parent() != Some(dir) {
+            return;
+        }
+        let (dir, old, new) = (
+            dir.to_path_buf(),
+            old.to_string_lossy().into_owned(),
+            new.to_string_lossy().into_owned(),
+        );
+        if let Err(e) = self.edit_meta(&dir, false, |m| m.rename_entry(&old, &new)) {
+            self.status = format!("Renamed, but the note did not follow: {e}");
+        }
+    }
+
+    /// Give a duplicate the original's note, after a paste into the folder the
+    /// item already lives in.
+    fn meta_copy(&mut self, from: &Path, to: &Path) {
+        let (Some(dir), Some(old), Some(new)) = (from.parent(), from.file_name(), to.file_name()) else {
+            return;
+        };
+        if to.parent() != Some(dir) {
+            return;
+        }
+        let (dir, old, new) = (
+            dir.to_path_buf(),
+            old.to_string_lossy().into_owned(),
+            new.to_string_lossy().into_owned(),
+        );
+        if let Err(e) = self.edit_meta(&dir, false, |m| m.copy_entry(&old, &new)) {
+            self.status = format!("Copied, but the note did not: {e}");
+        }
+    }
+
+    /// Drop the entries for items that have gone to the recycle bin, so a
+    /// sidecar does not grow for ever and a restore does not resurrect a note
+    /// onto whatever now has that name.
+    fn meta_removed(&mut self, paths: &[PathBuf]) {
+        let mut by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for p in paths {
+            if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
+                by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .push(name.to_string_lossy().into_owned());
+            }
+        }
+        for (dir, names) in by_dir {
+            let r = self.edit_meta(&dir, false, |m| {
+                let mut changed = false;
+                for n in &names {
+                    changed |= m.remove_entry(n);
+                }
+                changed
+            });
+            if let Err(e) = r {
+                self.status = format!("Deleted, but the notes file was not updated: {e}");
+            }
+        }
+    }
+
+    /// Write the Properties window's note and tags into the sidecar.
+    ///
+    /// A failure leaves the typed text exactly where it is: the window stays
+    /// open with the note still in it and the status line says why, because
+    /// the folder being unwritable is not the user's mistake to lose work to.
+    fn save_item_meta(&mut self, p: &mut Props) {
+        let Some((dir, key)) = p.home.clone() else { return };
+        let note = meta::normalize_note(&p.note);
+        let tags = meta::normalize_tags(&p.tags);
+        let (n, t) = (note.clone(), tags.clone());
+        let k = key.clone();
+        let r = self.edit_meta(&dir, true, move |m| {
+            let drop_it = {
+                let item = m.items.entry(k.clone()).or_default();
+                item.note = n;
+                item.tags = t;
+                item.updated = meta::now();
+                // Clearing both fields removes the entry rather than leaving
+                // an empty record, unless another writer's keys are on it.
+                item.is_empty()
+            };
+            if drop_it {
+                m.items.remove(&k);
+            }
+            true
+        });
+        match r {
+            Ok(_) => {
+                p.tags = meta::tags_line(&tags);
+                p.note = note;
+                p.loaded = (p.note.clone(), p.tags.clone());
+                self.reload();
+                self.status = format!("Note saved in {}", meta::path(&dir).display());
+            }
+            Err(e) => self.status = format!("Note not saved: {e}"),
+        }
     }
 
     /// Apply a confirmed modal action.
@@ -945,14 +1201,20 @@ impl ExplorerApp {
                 if dst != path && dst.exists() {
                     Err(format!("{} already exists", dst.display()))
                 } else {
-                    fs::rename(&path, &dst).map_err(|e| e.to_string()).map(|()| {
-                        self.undo = Some(Undo::Rename(dst, path));
-                    })
+                    match fs::rename(&path, &dst) {
+                        Ok(()) => {
+                            self.meta_rename(&path, &dst);
+                            self.undo = Some(Undo::Rename(dst, path));
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
             }
             Modal::Delete { paths } => {
                 let n = paths.len();
                 trash_ops::delete_many_to_trash(&paths).map(|()| {
+                    self.meta_removed(&paths);
                     // Undo restores the first one; the bin holds the rest.
                     if let Some(first) = paths.into_iter().next() {
                         self.undo = Some(Undo::Delete(first));
@@ -1368,18 +1630,27 @@ impl ExplorerApp {
         // Only the list area, not the tab strip above it.
         let pane = ui.available_rect_before_wrap();
 
-        TableBuilder::new(ui)
+        // A folder nobody has annotated looks exactly as it did before.
+        let show_note = self.has_notes();
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::initial(90.0).at_least(60.0))
             .column(Column::initial(150.0).at_least(100.0))
-            .column(Column::initial(90.0).at_least(60.0))
+            .column(Column::initial(90.0).at_least(60.0));
+        if show_note {
+            table = table.column(Column::initial(200.0).at_least(80.0).clip(true));
+        }
+        table
             .header(22.0, |mut h| {
                 h.col(|ui| if header(ui, "Name", SortKey::Name, self) { sort = Some(SortKey::Name) });
                 h.col(|ui| if header(ui, "Size", SortKey::Size, self) { sort = Some(SortKey::Size) });
                 h.col(|ui| if header(ui, "Modified", SortKey::Modified, self) { sort = Some(SortKey::Modified) });
                 h.col(|ui| { ui.strong("Type"); });
+                if show_note {
+                    h.col(|ui| { ui.strong("Note"); });
+                }
             })
             .body(|body| {
                 body.rows(if self.compact { 18.0 } else { 24.0 }, entries.len(), |mut row| {
@@ -1393,7 +1664,19 @@ impl ExplorerApp {
                         let mut job = egui::text::LayoutJob::default();
                         job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
                         job.append(&e.name, 0.0, egui::TextFormat { font_id: font, color: ui.visuals().text_color(), ..Default::default() });
-                        ui.add(egui::Label::new(job).truncate());
+                        let resp = ui.add(egui::Label::new(job).truncate());
+                        // `contains_pointer`, not `hovered`: the catch-all
+                        // interact registered over the whole pane after the
+                        // rows is the topmost widget, so nothing inside a row
+                        // is ever the hovered one.
+                        if !e.note.is_empty() && resp.contains_pointer() {
+                            egui::show_tooltip_at_pointer(
+                                ui.ctx(),
+                                ui.layer_id(),
+                                egui::Id::new("note-tooltip"),
+                                |ui| ui.label(&e.note),
+                            );
+                        }
                     });
                     row.col(|ui| {
                         if e.is_dir {
@@ -1410,6 +1693,29 @@ impl ExplorerApp {
                     row.col(|ui| {
                         ui.label(if e.is_dir { "Folder".to_string() } else { ext_type(&e.name) });
                     });
+                    if show_note {
+                        row.col(|ui| {
+                            if e.note.is_empty() && e.tags.is_empty() {
+                                return;
+                            }
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let mut job = egui::text::LayoutJob::default();
+                            // A multi-line note would push the row past its
+                            // fixed height, so the cell shows it on one line
+                            // and the hover on the name shows the whole thing.
+                            let one_line = e.note.replace(['\r', '\n'], " ");
+                            job.append(&one_line, 0.0, egui::TextFormat { font_id: font.clone(), color: ui.visuals().text_color(), ..Default::default() });
+                            if !e.tags.is_empty() {
+                                let tags: Vec<String> = e.tags.iter().map(|t| format!("#{t}")).collect();
+                                job.append(
+                                    &format!(" {}", tags.join(" ")),
+                                    0.0,
+                                    egui::TextFormat { font_id: font, color: ui.visuals().weak_text_color(), ..Default::default() },
+                                );
+                            }
+                            ui.add(egui::Label::new(job).truncate());
+                        });
+                    }
                     let r = row.response();
                     if r.contains_pointer() {
                         hovered_row = Some(i);
@@ -1643,8 +1949,17 @@ impl ExplorerApp {
         }
     }
 
+    /// The Properties window, which also edits the note and tags.
+    ///
+    /// `Props` is taken out of `self` for the duration: the text fields need
+    /// `&mut` on it while the closure runs, and Save needs `&mut self`, which
+    /// the closure cannot have. Both are applied after the closure has
+    /// returned, the same way the paste-conflict and exit-guard windows defer
+    /// their decisions.
     fn properties_window(&mut self, ctx: &egui::Context) {
-        let Some(p) = &self.props else { return };
+        let Some(mut p) = self.props.take() else { return };
+        let mut save = false;
+        let mut revert = false;
         let mut open = true;
         let name = p
             .path
@@ -1704,9 +2019,56 @@ impl ExplorerApp {
                         let _ = platform::native_properties(&p.path);
                     }
                 });
+                ui.separator();
+                match &p.home {
+                    Some((dir, _)) => {
+                        let store = meta::path(dir);
+                        ui.label("Note");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut p.note)
+                                .desired_width(360.0)
+                                .desired_rows(3)
+                                .hint_text("What this folder is for"),
+                        );
+                        ui.label("Tags");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut p.tags)
+                                .desired_width(360.0)
+                                .hint_text("comma, separated"),
+                        );
+                        if p.read_only {
+                            ui.small(format!(
+                                "{} was written by a newer version. It is shown here but not written over.",
+                                store.display()
+                            ));
+                        }
+                        let edited = (p.note.as_str(), p.tags.as_str()) != (p.loaded.0.as_str(), p.loaded.1.as_str());
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(edited && !p.read_only, egui::Button::new("Save")).clicked() {
+                                save = true;
+                            }
+                            if ui.add_enabled(edited, egui::Button::new("Revert")).clicked() {
+                                revert = true;
+                            }
+                        });
+                        ui.small(format!("Kept in {}", store.display()));
+                    }
+                    // Annotating a drive root would need a sidecar in a folder
+                    // above it, and there is none.
+                    None => {
+                        ui.small("A drive root cannot carry a note.");
+                    }
+                }
             });
-        if !open {
-            self.props = None;
+        if revert {
+            p.note = p.loaded.0.clone();
+            p.tags = p.loaded.1.clone();
+        }
+        if save {
+            self.save_item_meta(&mut p);
+        }
+        if open {
+            self.props = Some(p);
         }
     }
 
