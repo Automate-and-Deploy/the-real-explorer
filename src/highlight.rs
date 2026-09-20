@@ -894,6 +894,21 @@ impl DocHighlight {
         }
     }
 
+    /// Tell the highlighter which lines are on screen.
+    ///
+    /// [`layout_job`](Self::layout_job) records the range it was asked for,
+    /// and that record is what the section window and the refill work from.
+    /// A virtualised view asks one line at a time, so the last of those calls
+    /// would leave the window one row wide and everything else on screen
+    /// permanently plain. It calls this once a frame, after painting, with the
+    /// whole visible span. Takes `&self` for the same reason `layout_job`
+    /// does: the record is a `Cell`, and the view holds the highlighter by
+    /// shared reference while it paints.
+    pub fn note_visible(&self, lines: Range<usize>) {
+        let total = self.line_starts.len();
+        self.last_range.set(Some((lines.start.min(total), lines.end.min(total))));
+    }
+
     /// True when the per-line byte index matches `text`, so a `visible` range
     /// handed to [`layout_job`](Self::layout_job) means the lines the caller
     /// thinks it means.
@@ -1478,15 +1493,24 @@ mod tests {
         assert!(coloured.sections.len() > top.len(), "the top was never coloured to begin with");
 
         // Scroll far away. The next `advance` trims the top's runs, exactly as
-        // it does when the reader jumps to the end of a large file.
+        // it does when the reader jumps to the end of a large file. The view
+        // asks one line at a time and then reports the span, so this does too:
+        // reporting is the only thing that tells the window it is wider than
+        // the last row painted.
         let far = lines - 10..lines - 2;
-        let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(far), f32::INFINITY);
+        for i in far.clone() {
+            let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(i..i + 1), f32::INFINITY);
+        }
+        hl.note_visible(far);
         while hl.advance(&text, Budget::unlimited()) {}
 
-        // Scroll back. The job asked for right after the jump may still be
-        // plain, because the refill happens in `advance`; by the next frame it
-        // has to be what the same range gave before.
-        let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(top.clone()), f32::INFINITY);
+        // Scroll back. The jobs asked for right after the jump may still be
+        // plain, because the refill happens in `advance`; by the next frame
+        // they have to be what the same range gave before.
+        for i in top.clone() {
+            let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(i..i + 1), f32::INFINITY);
+        }
+        hl.note_visible(top.clone());
         while hl.advance(&text, Budget::unlimited()) {}
         let again = hl.layout_job(&text, font(), Color32::GRAY, Some(top), f32::INFINITY);
         assert_eq!(again.text, coloured.text);

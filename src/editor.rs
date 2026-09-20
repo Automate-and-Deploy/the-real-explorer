@@ -1910,6 +1910,11 @@ impl Editor {
             }
             painter.galley(pos, galley, v.plain);
         }
+        // Each job above asked for one line, so on its own the highlighter
+        // would think one row is all that is on screen and keep the cached
+        // colour for that row alone. Tell it the real span, once, after the
+        // rows that used it have been painted.
+        v.hl.note_visible(range.start..end);
         out
     }
 
