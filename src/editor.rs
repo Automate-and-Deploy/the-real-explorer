@@ -14,6 +14,17 @@
 //! toggle, a size cap and lossy read-only fallback for files the editor
 //! cannot safely round-trip, LSP-backed formatting for non-JSON files, hover
 //! on mouse dwell as well as Ctrl+K, and BOM-safe JSON handling.
+//!
+//! Two rendering paths share all of that. Below [`LARGE_DOC_BYTES`] a
+//! document is an editable `egui::TextEdit` laid out in one galley, which is
+//! what every feature here was written against. At or above it the document
+//! opens read-only into [`Editor::show_large`], a virtualised view that lays
+//! out only the rows on screen: egui keeps a pre-reserved mesh for every
+//! glyph in a galley and never shrinks it, about 171 bytes per character,
+//! so one galley over a 5.8 MB file is 1 GB of memory that no amount of
+//! clipping recovers. The split is by size rather than by a mode switch
+//! because the two paths do not agree on who owns the cursor, and only the
+//! editable one can answer that today.
 
 use std::collections::HashMap;
 use std::fs;
@@ -28,12 +39,39 @@ use crate::textpos::{find_matches, replace_all, LineIndex};
 
 /// Files larger than this are refused at open.
 ///
-/// egui lays the whole buffer into one galley and keeps a pre-reserved mesh
-/// for every glyph, measured at about 215 bytes of memory per character on
-/// this app: a 5.8 MB file cost 1.25 GB. Until the editor lays out only the
-/// visible lines, 2 MiB keeps the worst case near 450 MB. The cap goes back
-/// up when that lands.
-const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024;
+/// Anything at or above [`LARGE_DOC_BYTES`] opens into the virtualised
+/// read-only view, whose cost is the viewport rather than the document, so
+/// the ceiling is now about reading the bytes and indexing the lines rather
+/// than about laying them out.
+const MAX_OPEN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// At or above this size a document opens read-only into the virtualised
+/// view instead of a `TextEdit`.
+///
+/// Measured on egui 0.29: one galley costs about 171 bytes per character and
+/// an edit frame holds two of them, so 1 MiB is already 180 MB steady and
+/// 360 MB per keystroke on the `TextEdit` path. Below the threshold that is
+/// the price of a real editor; at or above it the document is worth more as
+/// something you can open at all than as something you can type into.
+/// Editing the virtualised view means the editor owning the cursor, the
+/// selection and undo, which is a separate piece of work.
+pub const LARGE_DOC_BYTES: usize = 1024 * 1024;
+
+/// How much of one source line the virtualised view lays out.
+///
+/// Word wrap is off there, so a line is one row however long it is. Without
+/// a cap a minified file with no newlines would be a single galley over the
+/// whole document, which is the cost the view exists to avoid. Columns past
+/// this are not drawn and the toolbar says so.
+const LINE_COLUMN_CAP: usize = 4096;
+
+/// Longest line the syntax highlighter is willing to see.
+///
+/// syntect parses one whole line per call, so a multi-megabyte line is an
+/// unbounded regex scan with no way to yield in the middle of it. A document
+/// with a line this long is shown plain rather than hanging the parser; the
+/// only real files shaped like that are minified or generated.
+const HIGHLIGHT_MAX_LINE_BYTES: usize = 128 * 1024;
 
 /// Largest markdown document the preview will render. The preview is a
 /// separate whole-document renderer with the same per-glyph cost as the
@@ -82,6 +120,19 @@ impl Doc {
     /// bytes; every edit path calls it so nothing reads a stale index.
     fn text_replaced(&mut self) {
         self.lines = LineIndex::build(&self.text);
+    }
+
+    /// How far the background colouring pass has got, or `None` when there is
+    /// nothing outstanding. Exposed so the headless tests can wait for a
+    /// quiet frame before measuring allocation.
+    pub fn colouring_progress(&self) -> Option<f32> {
+        self.hl.progress()
+    }
+
+    /// Whether this document's lines are short enough for syntect to parse
+    /// one at a time. See [`HIGHLIGHT_MAX_LINE_BYTES`].
+    fn highlightable(&self) -> bool {
+        self.lines.max_line_bytes() <= HIGHLIGHT_MAX_LINE_BYTES
     }
 }
 
@@ -151,6 +202,16 @@ pub struct Editor {
     /// Index of a dirty tab pending its close confirmation.
     pending_close: Option<usize>,
     last_disk_check: Instant,
+    /// Size at or above which a document uses the virtualised read-only view.
+    /// A field rather than [`LARGE_DOC_BYTES`] directly so a test can put a
+    /// small fixture through the same path; nothing in the app changes it.
+    large_threshold: usize,
+    /// Vertical scroll offset the large view reported last frame, so PageUp
+    /// and PageDown have something to move relative to.
+    large_offset: f32,
+    /// A line on screen was longer than [`LINE_COLUMN_CAP`] last frame, so
+    /// the toolbar says the view is not showing all of it.
+    large_line_clipped: bool,
 }
 
 impl Editor {
@@ -181,6 +242,43 @@ impl Editor {
             // Backdated so the very first frame already checks once, instead
             // of waiting a full second after startup.
             last_disk_check: Instant::now() - Duration::from_secs(1),
+            large_threshold: LARGE_DOC_BYTES,
+            large_offset: 0.0,
+            large_line_clipped: false,
+        }
+    }
+
+    /// Move the size at which documents switch to the virtualised read-only
+    /// view. For tests that need a small fixture on the large path (or a
+    /// large one on the `TextEdit` path) without writing megabytes to disk.
+    pub fn set_large_threshold(&mut self, bytes: usize) {
+        self.large_threshold = bytes;
+    }
+
+    /// True when document `i` is shown through the virtualised read-only view.
+    pub fn is_large(&self, i: usize) -> bool {
+        self.docs.get(i).map(|d| d.text.len() >= self.large_threshold).unwrap_or(false)
+    }
+
+    /// True when document `i` accepts edits: not a lossy decode, and not big
+    /// enough to be on the read-only virtualised path.
+    fn editable(&self, i: usize) -> bool {
+        self.docs.get(i).map(|d| !d.read_only).unwrap_or(false) && !self.is_large(i)
+    }
+
+    /// Why document `i` will not take an edit, phrased for the status bar.
+    /// The lossy-decode case comes first because it is the stricter one: such
+    /// a file cannot be written back safely at any size.
+    fn readonly_reason(&self, i: usize) -> String {
+        if self.docs.get(i).map(|d| d.read_only).unwrap_or(false) {
+            "Cannot edit: file is read-only (opened as lossy UTF-8)".into()
+        } else if self.is_large(i) {
+            format!(
+                "Cannot edit: files of {} MiB and over open read-only",
+                self.large_threshold / (1024 * 1024)
+            )
+        } else {
+            "Cannot edit this document".into()
         }
     }
 
@@ -332,6 +430,9 @@ impl Editor {
     }
 
     fn format_json_at(&mut self, i: usize) -> Result<(), String> {
+        if !self.editable(i) {
+            return Err(self.readonly_reason(i).replace("Cannot edit", "Cannot format"));
+        }
         let Some(d) = self.docs.get_mut(i) else { return Ok(()) };
         if !is_json(&d.path) {
             return Err("Format: only JSON is supported so far".into());
@@ -383,10 +484,11 @@ impl Editor {
             }
             return;
         }
-        if d.read_only {
-            self.status = "Cannot format: file is read-only (opened as lossy UTF-8)".into();
+        if !self.editable(self.active) {
+            self.status = self.readonly_reason(self.active).replace("Cannot edit", "Cannot format");
             return;
         }
+        let Some(d) = self.docs.get(self.active) else { return };
         let Some(server_name) = d.server.clone() else {
             self.status = "Format: no language server for this file".into();
             return;
@@ -404,8 +506,10 @@ impl Editor {
     }
 
     fn save_doc(&mut self, i: usize, format_json_on_save: bool) {
-        if self.docs.get(i).map(|d| d.read_only).unwrap_or(false) {
-            self.status = "Cannot save: file is read-only (opened as lossy UTF-8)".into();
+        // A virtualised document is never dirty, so this only fires on an
+        // explicit Ctrl+S; saying so beats writing the file back unchanged.
+        if !self.editable(i) {
+            self.status = self.readonly_reason(i).replace("Cannot edit", "Cannot save");
             return;
         }
         if format_json_on_save && self.docs.get(i).map(|d| is_json(&d.path)).unwrap_or(false) {
@@ -652,6 +756,11 @@ impl Editor {
     }
 
     fn request_completion(&mut self) {
+        // Nothing can be inserted into a read-only or virtualised document,
+        // so asking the server would only produce a popup that refuses.
+        if !self.editable(self.active) {
+            return;
+        }
         let Some(d) = self.docs.get(self.active) else { return };
         let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) else { return };
         let (line, col) = d.lines.char_to_lsp(&d.text, self.cursor_char);
@@ -662,10 +771,10 @@ impl Editor {
     /// Insert a newline that keeps the current line's leading whitespace, and
     /// one more level after a line that ends in an opening bracket.
     fn insert_newline_with_indent(&mut self, ctx: &egui::Context, edit_id: egui::Id) {
-        let Some(d) = self.docs.get_mut(self.active) else { return };
-        if d.read_only {
+        if !self.editable(self.active) {
             return;
         }
+        let Some(d) = self.docs.get_mut(self.active) else { return };
         let at_c = self.cursor_char.min(d.lines.char_count());
         let at = d.lines.char_to_byte(&d.text, at_c);
         let line = d.lines.line_of_char(at_c);
@@ -688,6 +797,10 @@ impl Editor {
     }
 
     fn accept_completion(&mut self, ctx: &egui::Context, edit_id: egui::Id) {
+        if !self.editable(self.active) {
+            self.completion = None;
+            return;
+        }
         let Some(comp) = self.completion.take() else { return };
         let Some(item) = comp.items.get(comp.selected) else { return };
         let Some(d) = self.docs.get_mut(self.active) else { return };
@@ -719,6 +832,10 @@ impl Editor {
 
     fn open_find(&mut self, with_replace: bool) {
         self.goto_line = None;
+        // Ctrl+H on a document that cannot take an edit still opens the bar,
+        // because finding is the useful half; it just has no replace field
+        // rather than one whose buttons all refuse.
+        let with_replace = with_replace && self.editable(self.active);
         match &mut self.find {
             Some(f) => f.show_replace |= with_replace,
             None => {
@@ -758,11 +875,11 @@ impl Editor {
             return;
         };
         let active = self.active;
-        let Some(d) = self.docs.get_mut(active) else { return };
-        if d.read_only {
-            self.status = "Cannot replace: file is read-only".into();
+        if !self.editable(active) {
+            self.status = self.readonly_reason(active);
             return;
         }
+        let Some(d) = self.docs.get_mut(active) else { return };
         let matches = find_matches(&d.text, &query, ci);
         let Some(&(s, e)) = matches.get(current) else { return };
         let line = d.lines.line_of_byte(s);
@@ -791,11 +908,11 @@ impl Editor {
             return;
         };
         let active = self.active;
-        let Some(d) = self.docs.get_mut(active) else { return };
-        if d.read_only {
-            self.status = "Cannot replace: file is read-only".into();
+        if !self.editable(active) {
+            self.status = self.readonly_reason(active);
             return;
         }
+        let Some(d) = self.docs.get_mut(active) else { return };
         let (new_text, count) = replace_all(&d.text, &query, &replacement, ci);
         if count == 0 {
             self.status = "No matches".into();
@@ -826,6 +943,9 @@ impl Editor {
         else {
             return;
         };
+        // Switching to a read-only or virtualised tab with the bar already
+        // open must drop the replace half too, not just refuse its buttons.
+        let show_replace = show_replace && self.editable(active);
         let matches = find_matches(&self.docs[active].text, &query, ci);
         current = if matches.is_empty() { 0 } else { current.min(matches.len() - 1) };
 
@@ -1084,7 +1204,24 @@ impl Editor {
                 }
                 PreviewKind::None => {}
             }
-            ui.checkbox(&mut self.word_wrap, "Wrap");
+            let large = self.is_large(active);
+            ui.add_enabled(!large, egui::Checkbox::new(&mut self.word_wrap, "Wrap"))
+                .on_disabled_hover_text("The large-file view puts one source line on one row, so there is nothing to wrap against.");
+            if large {
+                let mib = self.docs[active].text.len() as f64 / (1024.0 * 1024.0);
+                ui.colored_label(
+                    Color32::from_rgb(0xe0, 0xaf, 0x68),
+                    format!("Read-only: {mib:.1} MiB, over the {} MiB editing limit", self.large_threshold / (1024 * 1024)),
+                )
+                .on_hover_text(
+                    "Above the limit the editor lays out only the rows on screen, which is what keeps a file this size \
+                     open at all. Find, go to line, diagnostics and hover work; typing, completion, replace and save do not.",
+                );
+                if self.large_line_clipped {
+                    ui.small(egui::RichText::new(format!("lines cut at {LINE_COLUMN_CAP} columns")).weak())
+                        .on_hover_text("A line on screen is longer than the view lays out. The text is all there in the file; only the drawing stops.");
+                }
+            }
             // A large file is no longer refused colour, it is coloured in
             // the background; say how far along that is and nothing else.
             if let Some(done) = self.docs[active].hl.progress() {
@@ -1252,7 +1389,10 @@ impl Editor {
         // Re-parse from the dirty watermark within a per-frame budget. Work
         // left over means the document is not fully coloured yet, so ask for
         // another frame rather than stalling this one.
-        if hl.advance(&self.docs[active].text, highlight::Budget::frame()) {
+        // A document with a line syntect cannot parse in bounded time is left
+        // uncoloured rather than parsed: `advance` is never called, so no
+        // index is ever built, and every job below falls back to plain.
+        if self.docs[active].highlightable() && hl.advance(&self.docs[active].text, highlight::Budget::frame()) {
             ctx.request_repaint();
         }
         // First line the widget changed this frame, handed to the highlighter
@@ -1273,7 +1413,22 @@ impl Editor {
         let mut cursor_pos: Option<egui::Pos2> = None;
         let mut text_changed = false;
 
-        {
+        if self.is_large(active) {
+            self.show_large(
+                ui,
+                active,
+                LargeView {
+                    hl: &hl,
+                    font_id: font_id.clone(),
+                    plain: hl_plain,
+                    row_height,
+                    available_height,
+                    diagnostics: &diag_ranges,
+                    matches: &find_matches_now,
+                    current_match: find_current,
+                },
+            );
+        } else {
         let hl_ref = &hl;
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
             // `None` asks for the whole document: today's `TextEdit` lays out
@@ -1399,7 +1554,7 @@ impl Editor {
                     }
                 });
             });
-        }
+        } // end of the editable `TextEdit` path
 
         if let Some(line) = edit_first_line {
             hl.note_edit(line);
@@ -1541,9 +1696,260 @@ impl Editor {
         }
     }
 
+    /// The virtualised read-only view used at or above [`LARGE_DOC_BYTES`].
+    ///
+    /// One `ScrollArea::show_rows` row per source line, one `LayoutJob` per
+    /// visible line, painted straight into the scroll area's painter. Nothing
+    /// off screen is laid out, so memory is a function of the window rather
+    /// than of the file: the same 5.8 MB document that costs a `TextEdit`
+    /// 1 GB of galley costs this about a megabyte.
+    ///
+    /// What survives from the editable path: the gutter, find highlighting
+    /// and jumps, go to line, diagnostic underlines and hover on dwell, all
+    /// recomputed per visible line. What does not: the cursor, selection,
+    /// typing, completion, auto-indent and replace, which all live in
+    /// `TextEdit` and are refused above the threshold rather than faked.
+    fn show_large(&mut self, ui: &mut egui::Ui, active: usize, v: LargeView<'_>) {
+        // Nothing in here takes keyboard focus, so a focus request left over
+        // from opening the file has to be dropped or it outlives the tab.
+        self.focus_next = false;
+        self.completion = None;
+
+        let row_height = v.row_height;
+        let line_count = self.docs[active].lines.line_count();
+        let digits = line_count.to_string().len().max(3);
+        let char_w = ui.fonts(|f| f.glyph_width(&v.font_id, '0'));
+        let gutter_w = digits as f32 * char_w + 10.0;
+
+        // Scroll targets are resolved to an offset before the area is built:
+        // the row a find jump or Ctrl+End wants is usually not laid out this
+        // frame, so there is no rect to call `scroll_to_rect` with.
+        let page = (v.available_height - row_height).max(row_height);
+        let max_offset = (line_count as f32 * row_height - v.available_height).max(0.0);
+        let mut offset: Option<f32> = None;
+        ui.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND, Key::Home) {
+                offset = Some(0.0);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::End) {
+                offset = Some(max_offset);
+            }
+            if i.consume_key(Modifiers::NONE, Key::PageUp) {
+                offset = Some((self.large_offset - page).max(0.0));
+            }
+            if i.consume_key(Modifiers::NONE, Key::PageDown) {
+                offset = Some((self.large_offset + page).min(max_offset));
+            }
+        });
+        if let Some(idx) = self.pending_scroll_to.take() {
+            let line = self.docs[active].lines.line_of_char(idx);
+            // A third of a screen above the hit rather than centred: what
+            // follows a match is usually what the reader wants with it.
+            offset = Some((line as f32 * row_height - v.available_height / 3.0).clamp(0.0, max_offset));
+        }
+
+        let (new_offset, rows) = ui
+            .scope(|ui| {
+                // `show_rows` measures in rows of `row_height + item_spacing.y`.
+                // Zeroing the spacing makes one row exactly one text row, which
+                // is what keeps the gutter aligned with the text and the
+                // y-to-line arithmetic below exact.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut area = egui::ScrollArea::vertical()
+                    .id_salt(("editor-large", active))
+                    .auto_shrink([false, false])
+                    .max_height(v.available_height);
+                if let Some(o) = offset {
+                    area = area.vertical_scroll_offset(o);
+                }
+                let out = area.show_rows(ui, row_height, line_count, |ui, range| {
+                    self.paint_large_rows(ui, active, &v, range, gutter_w, line_count)
+                });
+                (out.state.offset.y, out.inner)
+            })
+            .inner;
+        self.large_offset = new_offset;
+        self.large_line_clipped = rows.clipped;
+
+        // Hover on dwell. The row came from the pointer's y against the row
+        // height; the column comes from that row's own galley, which is the
+        // only galley there is to ask.
+        if let Some((galley, pos, row)) = rows.hovered {
+            if let Some((pointer, char_in_line)) = hover_dwell_fired(
+                &rows.response,
+                &galley,
+                pos,
+                &mut self.hover_watch,
+                &mut self.hover_requested_for,
+            ) {
+                let d = &self.docs[active];
+                let raw = &d.text[d.lines.line_bytes(row)];
+                let col: u32 = raw.chars().take(char_in_line).map(|c| c.len_utf16() as u32).sum();
+                let path = d.path.clone();
+                let server = d.server.clone();
+                if let Some(name) = server {
+                    if let Some(c) = self.servers.get_mut(&name) {
+                        let id = c.hover(&path, row as u32, col);
+                        self.hover = Some((id, String::new()));
+                        self.hover_anchor = Some(pointer);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draws the gutter and the text for the rows `show_rows` asked for.
+    ///
+    /// Split out of [`show_large`](Self::show_large) so the borrow of `self`
+    /// inside the scroll-area closure ends before the hover handling, which
+    /// needs `self.servers` mutably.
+    fn paint_large_rows(
+        &self,
+        ui: &mut egui::Ui,
+        active: usize,
+        v: &LargeView<'_>,
+        range: std::ops::Range<usize>,
+        gutter_w: f32,
+        line_count: usize,
+    ) -> LargeRows {
+        let row_height = v.row_height;
+        let end = range.end.min(line_count);
+        let shown = end.saturating_sub(range.start);
+        let width = ui.available_width().max(gutter_w + 32.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, shown as f32 * row_height), egui::Sense::hover());
+        let mut out = LargeRows { response: response.clone(), hovered: None, clipped: false };
+        if shown == 0 {
+            return out;
+        }
+        let painter = ui.painter().clone();
+        let weak = ui.visuals().weak_text_color();
+
+        // One galley for every line number on screen, the same trick the
+        // small path's gutter uses; a label per row was 125 MB at 90k lines.
+        let mut numbers = String::with_capacity(shown * 8);
+        for l in range.start..end {
+            numbers.push_str(&(l + 1).to_string());
+            numbers.push('\n');
+        }
+        let gutter = ui.fonts(|f| f.layout(numbers, v.font_id.clone(), weak, f32::INFINITY));
+        painter.galley(egui::pos2(rect.left() + 4.0, rect.top()), gutter, weak);
+
+        let text_x = rect.left() + gutter_w;
+        let hovered_row = response.hover_pos().and_then(|p| {
+            let r = ((p.y - rect.top()) / row_height).floor();
+            (r >= 0.0).then(|| range.start + r as usize).filter(|r| *r < end)
+        });
+
+        let d = &self.docs[active];
+        // Without a live index the highlighter cannot slice a line range and
+        // would hand back the whole document, so those rows are laid out here.
+        let indexed = v.hl.indexed_for(&d.text);
+        for row in range.start..end {
+            let br = d.lines.line_bytes(row);
+            let raw = &d.text[br.start..br.end];
+            // The newline is a row break inside a galley and every row here is
+            // its own galley, so including it would double each line's height.
+            let body = raw.strip_suffix('\n').unwrap_or(raw);
+            let body = body.strip_suffix('\r').unwrap_or(body);
+            let mut keep = body.len();
+            if keep > LINE_COLUMN_CAP {
+                keep = LINE_COLUMN_CAP;
+                while keep > 0 && !body.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                out.clipped = true;
+            }
+            let mut job = if indexed {
+                v.hl.layout_job_capped(
+                    &d.text,
+                    v.font_id.clone(),
+                    v.plain,
+                    Some(row..row + 1),
+                    f32::INFINITY,
+                    keep,
+                )
+            } else {
+                LayoutJob::simple(body[..keep].to_owned(), v.font_id.clone(), v.plain, f32::INFINITY)
+            };
+
+            // Diagnostics and find matches carry whole-document byte offsets;
+            // this job's offsets start at the line, so both are rebased and
+            // clipped to it before they are applied.
+            let b0 = br.start;
+            let diag: Vec<(usize, usize, Color32)> = v
+                .diagnostics
+                .iter()
+                .filter(|(s, e, _)| *e > b0 && *s < b0 + keep)
+                .map(|(s, e, c)| (s.saturating_sub(b0), (e - b0).min(keep), *c))
+                .filter(|(s, e, _)| e > s)
+                .collect();
+            underline_ranges(&mut job, &diag);
+
+            // Matches are sorted and non-overlapping, so the first one that
+            // can touch this line is a binary search rather than a scan of
+            // every hit in the document, once per row, per frame.
+            let first = v.matches.partition_point(|(_, e)| *e <= b0);
+            let mut local: Vec<(usize, usize)> = Vec::new();
+            let mut k = first;
+            while k < v.matches.len() && v.matches[k].0 < b0 + keep {
+                let (s, e) = v.matches[k];
+                let (ls, le) = (s.saturating_sub(b0), (e - b0).min(keep));
+                if le > ls {
+                    local.push((ls, le));
+                }
+                k += 1;
+            }
+            let current = v.current_match.and_then(|c| c.checked_sub(first)).filter(|c| *c < local.len());
+            highlight_find_matches(&mut job, &local, current);
+
+            let galley = ui.fonts(|f| f.layout_job(job));
+            let pos = egui::pos2(text_x, rect.top() + (row - range.start) as f32 * row_height);
+            if hovered_row == Some(row) {
+                out.hovered = Some((galley.clone(), pos, row));
+            }
+            painter.galley(pos, galley, v.plain);
+        }
+        // Each job above asked for one line, so on its own the highlighter
+        // would think one row is all that is on screen and keep the cached
+        // colour for that row alone. Tell it the real span, once, after the
+        // rows that used it have been painted.
+        v.hl.note_visible(range.start..end);
+        out
+    }
+
     fn prefix_len(&self) -> usize {
         self.cursor_char.saturating_sub(self.prefix_start())
     }
+}
+
+/// Everything [`Editor::show_large`] needs that `Editor::show` already worked
+/// out for the frame. Grouped rather than passed loose because the
+/// highlighter has been moved out of the document by then and has to travel
+/// as a borrow alongside the rest.
+struct LargeView<'a> {
+    hl: &'a highlight::DocHighlight,
+    font_id: egui::FontId,
+    plain: Color32,
+    row_height: f32,
+    available_height: f32,
+    /// Diagnostic spans as whole-document byte ranges with their colour.
+    diagnostics: &'a [(usize, usize, Color32)],
+    /// Find hits as whole-document byte ranges, ascending and disjoint.
+    matches: &'a [(usize, usize)],
+    /// Index into `matches` of the hit the find bar is sitting on.
+    current_match: Option<usize>,
+}
+
+/// What painting a screen of rows leaves for the caller to act on.
+struct LargeRows {
+    /// The whole row block, for pointer tests.
+    response: egui::Response,
+    /// The galley under the pointer with its origin and source line, so a
+    /// dwell can be turned into a column without a document-wide galley.
+    hovered: Option<(std::sync::Arc<egui::Galley>, egui::Pos2, usize)>,
+    /// A visible line was longer than [`LINE_COLUMN_CAP`].
+    clipped: bool,
 }
 
 /// Tracks how long the pointer has rested over `response` in roughly the

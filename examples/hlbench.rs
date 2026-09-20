@@ -8,14 +8,7 @@
 //! Run with `cargo run --release --example hlbench`. A debug build measures the
 //! debug build and is not worth reading.
 //!
-//! The module is pulled in by path rather than through the crate, because the
-//! crate has no library target yet (that is Stage 0 item 6 of the editor-memory
-//! plan); when `src/lib.rs` lands this becomes a plain `use`.
-
 #![allow(dead_code)]
-
-#[path = "../src/highlight.rs"]
-mod highlight;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{Color32, FontId};
 
-use highlight::{Budget, DocHighlight};
+use the_real_explorer::highlight::{self, Budget, DocHighlight};
 
 // --- counting allocator ----------------------------------------------------
 

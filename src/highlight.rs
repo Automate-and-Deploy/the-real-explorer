@@ -596,13 +596,14 @@ impl DocHighlight {
         self.drain_background();
         self.maybe_start_background(text);
         self.trim_sections();
+        let refill_more = self.refill_window(text, budget);
 
         let total = self.line_starts.len();
         if self.hl_to >= total {
             // The foreground caught up (or converged): whatever the background
             // pass still has to say is already known, so stop paying for it.
             self.bg = None;
-            return false;
+            return refill_more;
         }
 
         let ps = assets().syntaxes.clone();
@@ -700,7 +701,86 @@ impl DocHighlight {
         } else {
             self.cursor = None;
         }
-        self.hl_to < total || self.bg.is_some()
+        self.hl_to < total || self.bg.is_some() || refill_more
+    }
+
+    /// Re-derive the style runs for lines the view is asking for that an
+    /// earlier [`trim_sections`](Self::trim_sections) threw away.
+    ///
+    /// Trimming keeps the checkpoints and drops the runs, on the promise that
+    /// the runs can be rebuilt from them. Nothing rebuilt them: the main walk
+    /// only moves `hl_to` forward, so a line below the watermark whose runs
+    /// were trimmed stayed plain for the rest of the session. That is
+    /// invisible on the `TextEdit` path, which asks for the whole document and
+    /// is therefore never trimmed, and immediate on the virtualised one the
+    /// first time you scroll a long way and come back.
+    ///
+    /// The checkpoint stride is chosen to keep checkpoint memory under a cap,
+    /// so the replay from the nearest one is tens of lines, not thousands.
+    /// Returns true when the window is still not complete.
+    fn refill_window(&mut self, text: &str, budget: Budget) -> bool {
+        let Some((lo, hi)) = self.last_range.get() else { return false };
+        let hi = hi.min(self.hl_to).min(self.lines.len());
+        if lo >= hi {
+            return false;
+        }
+        let Some(first_missing) = (lo..hi).find(|i| self.lines[*i].runs.is_none()) else {
+            return false;
+        };
+        let ps = assets().syntaxes.clone();
+        let Some(name) = self.syntax.clone() else { return false };
+        let Some(syntax) = ps.find_syntax_by_name(&name) else { return false };
+        let highlighter = Highlighter::new(self.theme());
+
+        // Resume from the nearest checkpoint at or below the gap. The lines
+        // between it and the gap are parsed only to carry the state forward;
+        // their runs are already cached or deliberately gone.
+        let (mut line, mut parse, mut hstate) = {
+            let mut found = None;
+            for i in (0..first_missing).rev() {
+                if let Some(st) = &self.lines[i].state {
+                    found = Some((i + 1, st.0.clone(), st.1.clone()));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                (0, ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new()))
+            })
+        };
+
+        let started = Instant::now();
+        let mut walked = 0usize;
+        while line < hi {
+            if walked >= budget.lines {
+                break;
+            }
+            if let Some(limit) = budget.time {
+                if walked % 64 == 0 && walked > 0 && started.elapsed() >= limit {
+                    break;
+                }
+            }
+            let range = self.line_range(line);
+            let src = &text[range];
+            let ops = parse.parse_line(src, &ps).unwrap_or_default();
+            let mut runs: Vec<(u32, u16)> = Vec::new();
+            for (style, piece) in HighlightIterator::new(&mut hstate, &ops[..], src, &highlighter) {
+                if piece.is_empty() {
+                    continue;
+                }
+                let id = self.interner.intern(StyleKey::from_syntect(&style));
+                match runs.last_mut() {
+                    Some(last) if last.1 == id => last.0 += piece.len() as u32,
+                    _ => runs.push((piece.len() as u32, id)),
+                }
+            }
+            if line >= first_missing {
+                self.lines[line].runs = Some(runs.into_boxed_slice());
+            }
+            walked += 1;
+            line += 1;
+        }
+        self.last_advance_lines += walked;
+        line < hi
     }
 
     /// Start the initial pass off-thread for a large document. The UI never
@@ -814,6 +894,33 @@ impl DocHighlight {
         }
     }
 
+    /// Tell the highlighter which lines are on screen.
+    ///
+    /// [`layout_job`](Self::layout_job) records the range it was asked for,
+    /// and that record is what the section window and the refill work from.
+    /// A virtualised view asks one line at a time, so the last of those calls
+    /// would leave the window one row wide and everything else on screen
+    /// permanently plain. It calls this once a frame, after painting, with the
+    /// whole visible span. Takes `&self` for the same reason `layout_job`
+    /// does: the record is a `Cell`, and the view holds the highlighter by
+    /// shared reference while it paints.
+    pub fn note_visible(&self, lines: Range<usize>) {
+        let total = self.line_starts.len();
+        self.last_range.set(Some((lines.start.min(total), lines.end.min(total))));
+    }
+
+    /// True when the per-line byte index matches `text`, so a `visible` range
+    /// handed to [`layout_job`](Self::layout_job) means the lines the caller
+    /// thinks it means.
+    ///
+    /// A document with no grammar never builds the index, and neither does one
+    /// whose text moved without a `note_edit`. A virtualised view has to check
+    /// this before asking for a line range: the plain fallback below has no
+    /// index to slice with and hands back the whole document.
+    pub fn indexed_for(&self, text: &str) -> bool {
+        self.indexed_len == text.len() && self.syntax.is_some()
+    }
+
     /// Build a `LayoutJob`.
     ///
     /// `visible` is a line range. `None` means the whole document, which is
@@ -827,6 +934,27 @@ impl DocHighlight {
         plain_color: Color32,
         visible: Option<Range<usize>>,
         wrap_width: f32,
+    ) -> LayoutJob {
+        self.layout_job_capped(text, font_id, plain_color, visible, wrap_width, usize::MAX)
+    }
+
+    /// [`layout_job`](Self::layout_job) with a ceiling on how many bytes of the
+    /// range it emits, counted from the start of the range.
+    ///
+    /// The virtualised view lays one source line out per row with word wrap
+    /// off, so a file whose only newline is at the end would otherwise become
+    /// one galley holding every glyph in the document. Cutting the slice here
+    /// rather than truncating the finished job means the oversized line is
+    /// never copied, let alone laid out. The cut lands on a char boundary, so
+    /// the job is always valid UTF-8 the sections can index.
+    pub fn layout_job_capped(
+        &self,
+        text: &str,
+        font_id: FontId,
+        plain_color: Color32,
+        visible: Option<Range<usize>>,
+        wrap_width: f32,
+        max_bytes: usize,
     ) -> LayoutJob {
         let total = self.line_starts.len();
         let indexed = self.indexed_len == text.len() && self.syntax.is_some();
@@ -846,12 +974,12 @@ impl DocHighlight {
             } else {
                 text
             };
-            return LayoutJob::simple(slice.to_owned(), font_id, plain_color, wrap_width);
+            return LayoutJob::simple(cap_slice(slice, max_bytes).to_owned(), font_id, plain_color, wrap_width);
         }
 
         let base = if lo < total { self.line_starts[lo] } else { text.len() };
         let end = if hi < total { self.line_starts[hi] } else { text.len() };
-        let slice = &text[base..end];
+        let slice = cap_slice(&text[base..end], max_bytes);
 
         let mut job = LayoutJob {
             text: slice.to_owned(),
@@ -866,8 +994,13 @@ impl DocHighlight {
         let mut cursor = 0usize;
         let mut last_id: Option<u16> = None;
         for i in lo..hi {
+            // `slice` may stop short of the range when `max_bytes` bit, and
+            // then the last line it does reach is only partly present.
+            if cursor >= slice.len() {
+                break;
+            }
             let lr = self.line_range(i);
-            let len = lr.end - lr.start;
+            let len = (lr.end - lr.start).min(slice.len() - cursor);
             let runs = if i < self.hl_to { self.lines[i].runs.as_ref() } else { None };
             match runs {
                 Some(runs) if !runs.is_empty() => {
@@ -915,6 +1048,19 @@ impl DocHighlight {
         self.section_hint.set(job.sections.len());
         job
     }
+}
+
+/// The longest prefix of `s` that is at most `max_bytes` long and still ends
+/// on a char boundary.
+fn cap_slice(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn push_plain(job: &mut LayoutJob, from: usize, to: usize, fmt: &TextFormat) {
@@ -1326,6 +1472,57 @@ mod tests {
         );
         // 20 000 lines walked at this stride is 20 000 / stride checkpoints.
         assert_eq!(hl.checkpoint_count(), 20_000 / stride);
+    }
+
+    #[test]
+    fn a_range_whose_runs_were_trimmed_is_coloured_again_on_the_way_back() {
+        // Big enough that the section window cannot hold the whole document,
+        // which is what makes trimming fire at all.
+        let lines = SECTION_WINDOW_LINES * 3;
+        let mut text = String::with_capacity(lines * 24);
+        for i in 0..lines {
+            text.push_str("let x = \"s");
+            text.push_str(&(i % 97).to_string());
+            text.push_str("\"; // note\n");
+        }
+        let mut hl = DocHighlight::new("rs");
+        while hl.advance(&text, Budget::unlimited()) {}
+
+        let top = 2..10;
+        let coloured = hl.layout_job(&text, font(), Color32::GRAY, Some(top.clone()), f32::INFINITY);
+        assert!(coloured.sections.len() > top.len(), "the top was never coloured to begin with");
+
+        // Scroll far away. The next `advance` trims the top's runs, exactly as
+        // it does when the reader jumps to the end of a large file. The view
+        // asks one line at a time and then reports the span, so this does too:
+        // reporting is the only thing that tells the window it is wider than
+        // the last row painted.
+        let far = lines - 10..lines - 2;
+        for i in far.clone() {
+            let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(i..i + 1), f32::INFINITY);
+        }
+        hl.note_visible(far);
+        while hl.advance(&text, Budget::unlimited()) {}
+
+        // Scroll back. The jobs asked for right after the jump may still be
+        // plain, because the refill happens in `advance`; by the next frame
+        // they have to be what the same range gave before.
+        for i in top.clone() {
+            let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(i..i + 1), f32::INFINITY);
+        }
+        hl.note_visible(top.clone());
+        while hl.advance(&text, Budget::unlimited()) {}
+        let again = hl.layout_job(&text, font(), Color32::GRAY, Some(top), f32::INFINITY);
+        assert_eq!(again.text, coloured.text);
+        assert_eq!(
+            again.sections.len(),
+            coloured.sections.len(),
+            "a range that came back into view lost its colour"
+        );
+        for (a, b) in again.sections.iter().zip(coloured.sections.iter()) {
+            assert_eq!(a.byte_range, b.byte_range);
+            assert_eq!(a.format.color, b.format.color);
+        }
     }
 
     #[test]
