@@ -81,6 +81,10 @@ struct Entry {
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    /// Note from this folder's `.folder-meta.json`, empty when there is none.
+    note: String,
+    /// Tags from the same place, already lowercased.
+    tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -227,6 +231,16 @@ struct ExplorerApp {
     filter_focus: bool,
     /// Set when the selection moved by keyboard, so the list scrolls to it.
     scroll_to_selection: bool,
+    /// Parsed notes sidecar for `meta_dir`. `reload()` runs on every filter
+    /// keystroke, so the file is read once per folder and not once per key.
+    meta: Option<meta::FolderMeta>,
+    /// Folder `meta` was read from. `None` forces the next `reload()` to read
+    /// again; that is how F5 and a save invalidate the cache.
+    meta_dir: Option<PathBuf>,
+    /// Why the sidecar could not be read, if it could not. Repeated on the
+    /// status line rather than swallowed, because the alternative is a folder
+    /// whose notes have silently vanished.
+    meta_error: Option<String>,
 }
 
 impl ExplorerApp {
@@ -287,6 +301,9 @@ impl ExplorerApp {
             filter: String::new(),
             filter_focus: false,
             scroll_to_selection: false,
+            meta: None,
+            meta_dir: None,
+            meta_error: None,
         };
         app.reload();
         app.expand_ancestors(&start);
@@ -415,8 +432,44 @@ impl ExplorerApp {
         }
     }
 
+    /// Read the notes sidecar for the current folder unless it is already
+    /// cached. Called from `reload()`, which runs on every filter keystroke.
+    fn load_meta(&mut self) {
+        if self.meta_dir.as_deref() == Some(self.cwd.as_path()) {
+            return;
+        }
+        match meta::load(&self.cwd) {
+            Ok(m) => {
+                self.meta = m;
+                self.meta_error = None;
+            }
+            Err(e) => {
+                self.meta = None;
+                self.meta_error = Some(e);
+            }
+        }
+        self.meta_dir = Some(self.cwd.clone());
+    }
+
+    /// Forget the cached sidecar, so the next `reload()` re-reads it.
+    fn invalidate_meta(&mut self) {
+        self.meta_dir = None;
+    }
+
+    /// True when this folder has at least one annotated entry, which is what
+    /// decides whether the details list shows a Note column at all. Read from
+    /// the sidecar rather than from `entries` so the column does not appear
+    /// and disappear as the filter narrows the list.
+    fn has_notes(&self) -> bool {
+        self.meta
+            .as_ref()
+            .map(|m| m.items.values().any(|i| !i.note.is_empty() || !i.tags.is_empty()))
+            .unwrap_or(false)
+    }
+
     /// Re-read the current directory into `entries` and sort.
     fn reload(&mut self) {
+        self.load_meta();
         self.entries.clear();
         match fs::read_dir(&self.cwd) {
             Ok(rd) => {
@@ -426,19 +479,25 @@ impl ExplorerApp {
                         continue;
                     }
                     let md = de.metadata().ok();
+                    let item = self.meta.as_ref().and_then(|m| m.items.get(&name));
                     self.entries.push(Entry {
                         name,
                         path: de.path(),
                         is_dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
                         size: md.as_ref().map(|m| m.len()).unwrap_or(0),
                         modified: md.and_then(|m| m.modified().ok()),
+                        note: item.map(|i| i.note.clone()).unwrap_or_default(),
+                        tags: item.map(|i| i.tags.clone()).unwrap_or_default(),
                     });
                 }
                 if !self.filter.is_empty() {
                     let needle = self.filter.to_lowercase();
                     self.entries.retain(|e| e.name.to_lowercase().contains(&needle));
                 }
-                self.status = format!("{} items", self.entries.len());
+                self.status = match &self.meta_error {
+                    Some(e) => format!("{} items — {e}", self.entries.len()),
+                    None => format!("{} items", self.entries.len()),
+                };
             }
             Err(e) => self.status = format!("Cannot read {}: {e}", self.cwd.display()),
         }
@@ -452,9 +511,12 @@ impl ExplorerApp {
     }
 
     /// Reload the list and drop the tree cache so new or renamed folders show.
+    /// This is F5, and F5 is what the user presses after editing a sidecar by
+    /// hand, so the notes cache goes too.
     fn refresh_all(&mut self) {
         self.tree_children.clear();
         self.tree_files.clear();
+        self.invalidate_meta();
         self.reload();
     }
 
