@@ -1405,6 +1405,30 @@ mod tests {
         assert_eq!(first_changed_line("é\nx\n", "é\ny\n"), 1);
     }
 
+    /// epaint asserts that a job's sections are contiguous and cover its text,
+    /// and panics otherwise. Push every fixture through a real `Context` so a
+    /// malformed job is caught here rather than on the first frame the user
+    /// opens that language.
+    #[test]
+    fn every_job_lays_out_through_epaint() {
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        for ext in ["rs", "ts", "py", "go", "c", "json", "toml", "md", "html", "css"] {
+            let text = fixture(ext);
+            let mut hl = DocHighlight::new(ext);
+            while hl.advance(&text, Budget::unlimited()) {}
+
+            let whole = hl.layout_job(&text, font(), Color32::GRAY, None, 400.0);
+            let galley = ctx.fonts(|f| f.layout_job(whole));
+            assert_eq!(galley.text(), text, "galley text differs for .{ext}");
+
+            let part = hl.layout_job(&text, font(), Color32::GRAY, Some(2..5), 400.0);
+            let expect = part.text.clone();
+            let galley = ctx.fonts(|f| f.layout_job(part));
+            assert_eq!(galley.text(), expect, "windowed galley differs for .{ext}");
+        }
+    }
+
     #[test]
     fn a_reset_reparses_from_scratch() {
         let mut hl = DocHighlight::new("rs");
