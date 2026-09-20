@@ -31,6 +31,12 @@ pub struct LineIndex {
     starts: Vec<LineStart>,
     total_bytes: u32,
     total_chars: u32,
+    /// Longest line in bytes, its newline included. Free to keep during the
+    /// build pass, and it is what tells a caller whether per-line work on this
+    /// document is bounded at all: a file whose only newline is the last byte
+    /// is one line several megabytes wide, and anything that lays out or
+    /// parses a whole line at a time has to refuse it rather than try.
+    max_line_bytes: u32,
 }
 
 impl LineIndex {
@@ -41,15 +47,27 @@ impl LineIndex {
         let mut starts = Vec::with_capacity(bytes.len() / 40 + 1);
         starts.push(LineStart { byte: 0, chr: 0 });
         let mut chars = 0u32;
+        let mut max_line_bytes = 0u32;
+        let mut line_start = 0usize;
         for (i, &b) in bytes.iter().enumerate() {
             if b & 0xC0 != 0x80 {
                 chars += 1;
             }
             if b == b'\n' {
                 starts.push(LineStart { byte: (i + 1) as u32, chr: chars });
+                max_line_bytes = max_line_bytes.max((i + 1 - line_start) as u32);
+                line_start = i + 1;
             }
         }
-        Self { starts, total_bytes: bytes.len() as u32, total_chars: chars }
+        // The text after the last newline is a line too, and on a file with no
+        // newline at all it is the only one.
+        max_line_bytes = max_line_bytes.max((bytes.len() - line_start) as u32);
+        Self { starts, total_bytes: bytes.len() as u32, total_chars: chars, max_line_bytes }
+    }
+
+    /// Length of the longest line in bytes, its newline included.
+    pub fn max_line_bytes(&self) -> usize {
+        self.max_line_bytes as usize
     }
 
     /// Number of lines, counting a trailing newline as starting one more.
@@ -217,6 +235,17 @@ mod tests {
         assert_eq!(ix.char_count(), 8);
         // Past the end clamps rather than panics.
         assert_eq!(ix.line_byte_start(99), text.len());
+    }
+
+    #[test]
+    fn max_line_bytes_counts_the_newline_and_the_unterminated_last_line() {
+        assert_eq!(LineIndex::build("aa\nbbbb").max_line_bytes(), 4);
+        assert_eq!(LineIndex::build("aaaaa\nb").max_line_bytes(), 6);
+        assert_eq!(LineIndex::build("").max_line_bytes(), 0);
+        assert_eq!(LineIndex::build("\n").max_line_bytes(), 1);
+        // No newline anywhere: the whole document is one line, which is the
+        // shape the virtualised view has to cap rather than lay out.
+        assert_eq!(LineIndex::build("abcdef").max_line_bytes(), 6);
     }
 
     #[test]

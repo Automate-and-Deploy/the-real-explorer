@@ -814,6 +814,18 @@ impl DocHighlight {
         }
     }
 
+    /// True when the per-line byte index matches `text`, so a `visible` range
+    /// handed to [`layout_job`](Self::layout_job) means the lines the caller
+    /// thinks it means.
+    ///
+    /// A document with no grammar never builds the index, and neither does one
+    /// whose text moved without a `note_edit`. A virtualised view has to check
+    /// this before asking for a line range: the plain fallback below has no
+    /// index to slice with and hands back the whole document.
+    pub fn indexed_for(&self, text: &str) -> bool {
+        self.indexed_len == text.len() && self.syntax.is_some()
+    }
+
     /// Build a `LayoutJob`.
     ///
     /// `visible` is a line range. `None` means the whole document, which is
@@ -827,6 +839,27 @@ impl DocHighlight {
         plain_color: Color32,
         visible: Option<Range<usize>>,
         wrap_width: f32,
+    ) -> LayoutJob {
+        self.layout_job_capped(text, font_id, plain_color, visible, wrap_width, usize::MAX)
+    }
+
+    /// [`layout_job`](Self::layout_job) with a ceiling on how many bytes of the
+    /// range it emits, counted from the start of the range.
+    ///
+    /// The virtualised view lays one source line out per row with word wrap
+    /// off, so a file whose only newline is at the end would otherwise become
+    /// one galley holding every glyph in the document. Cutting the slice here
+    /// rather than truncating the finished job means the oversized line is
+    /// never copied, let alone laid out. The cut lands on a char boundary, so
+    /// the job is always valid UTF-8 the sections can index.
+    pub fn layout_job_capped(
+        &self,
+        text: &str,
+        font_id: FontId,
+        plain_color: Color32,
+        visible: Option<Range<usize>>,
+        wrap_width: f32,
+        max_bytes: usize,
     ) -> LayoutJob {
         let total = self.line_starts.len();
         let indexed = self.indexed_len == text.len() && self.syntax.is_some();
@@ -846,12 +879,12 @@ impl DocHighlight {
             } else {
                 text
             };
-            return LayoutJob::simple(slice.to_owned(), font_id, plain_color, wrap_width);
+            return LayoutJob::simple(cap_slice(slice, max_bytes).to_owned(), font_id, plain_color, wrap_width);
         }
 
         let base = if lo < total { self.line_starts[lo] } else { text.len() };
         let end = if hi < total { self.line_starts[hi] } else { text.len() };
-        let slice = &text[base..end];
+        let slice = cap_slice(&text[base..end], max_bytes);
 
         let mut job = LayoutJob {
             text: slice.to_owned(),
@@ -866,8 +899,13 @@ impl DocHighlight {
         let mut cursor = 0usize;
         let mut last_id: Option<u16> = None;
         for i in lo..hi {
+            // `slice` may stop short of the range when `max_bytes` bit, and
+            // then the last line it does reach is only partly present.
+            if cursor >= slice.len() {
+                break;
+            }
             let lr = self.line_range(i);
-            let len = lr.end - lr.start;
+            let len = (lr.end - lr.start).min(slice.len() - cursor);
             let runs = if i < self.hl_to { self.lines[i].runs.as_ref() } else { None };
             match runs {
                 Some(runs) if !runs.is_empty() => {
@@ -915,6 +953,19 @@ impl DocHighlight {
         self.section_hint.set(job.sections.len());
         job
     }
+}
+
+/// The longest prefix of `s` that is at most `max_bytes` long and still ends
+/// on a char boundary.
+fn cap_slice(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn push_plain(job: &mut LayoutJob, from: usize, to: usize, fmt: &TextFormat) {
