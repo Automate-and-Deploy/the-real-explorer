@@ -491,8 +491,11 @@ impl ExplorerApp {
                     });
                 }
                 if !self.filter.is_empty() {
+                    // Name, note or any tag: typing "tax" finds both the file
+                    // called tax and the one you annotated with it. Lowercase
+                    // the needle once here rather than once per row.
                     let needle = self.filter.to_lowercase();
-                    self.entries.retain(|e| e.name.to_lowercase().contains(&needle));
+                    self.entries.retain(|e| meta::matches(&needle, &e.name, &e.note, &e.tags));
                 }
                 self.status = match &self.meta_error {
                     Some(e) => format!("{} items — {e}", self.entries.len()),
