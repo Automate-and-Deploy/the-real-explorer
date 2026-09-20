@@ -5,3 +5,6 @@
 
 # per-project UI settings this app writes for whoever opens the repo in it
 /.code
+
+# notes and tags this app writes into any folder you annotate
+.folder-meta.json
