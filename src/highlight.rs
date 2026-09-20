@@ -596,13 +596,14 @@ impl DocHighlight {
         self.drain_background();
         self.maybe_start_background(text);
         self.trim_sections();
+        let refill_more = self.refill_window(text, budget);
 
         let total = self.line_starts.len();
         if self.hl_to >= total {
             // The foreground caught up (or converged): whatever the background
             // pass still has to say is already known, so stop paying for it.
             self.bg = None;
-            return false;
+            return refill_more;
         }
 
         let ps = assets().syntaxes.clone();
@@ -700,7 +701,86 @@ impl DocHighlight {
         } else {
             self.cursor = None;
         }
-        self.hl_to < total || self.bg.is_some()
+        self.hl_to < total || self.bg.is_some() || refill_more
+    }
+
+    /// Re-derive the style runs for lines the view is asking for that an
+    /// earlier [`trim_sections`](Self::trim_sections) threw away.
+    ///
+    /// Trimming keeps the checkpoints and drops the runs, on the promise that
+    /// the runs can be rebuilt from them. Nothing rebuilt them: the main walk
+    /// only moves `hl_to` forward, so a line below the watermark whose runs
+    /// were trimmed stayed plain for the rest of the session. That is
+    /// invisible on the `TextEdit` path, which asks for the whole document and
+    /// is therefore never trimmed, and immediate on the virtualised one the
+    /// first time you scroll a long way and come back.
+    ///
+    /// The checkpoint stride is chosen to keep checkpoint memory under a cap,
+    /// so the replay from the nearest one is tens of lines, not thousands.
+    /// Returns true when the window is still not complete.
+    fn refill_window(&mut self, text: &str, budget: Budget) -> bool {
+        let Some((lo, hi)) = self.last_range.get() else { return false };
+        let hi = hi.min(self.hl_to).min(self.lines.len());
+        if lo >= hi {
+            return false;
+        }
+        let Some(first_missing) = (lo..hi).find(|i| self.lines[*i].runs.is_none()) else {
+            return false;
+        };
+        let ps = assets().syntaxes.clone();
+        let Some(name) = self.syntax.clone() else { return false };
+        let Some(syntax) = ps.find_syntax_by_name(&name) else { return false };
+        let highlighter = Highlighter::new(self.theme());
+
+        // Resume from the nearest checkpoint at or below the gap. The lines
+        // between it and the gap are parsed only to carry the state forward;
+        // their runs are already cached or deliberately gone.
+        let (mut line, mut parse, mut hstate) = {
+            let mut found = None;
+            for i in (0..first_missing).rev() {
+                if let Some(st) = &self.lines[i].state {
+                    found = Some((i + 1, st.0.clone(), st.1.clone()));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                (0, ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new()))
+            })
+        };
+
+        let started = Instant::now();
+        let mut walked = 0usize;
+        while line < hi {
+            if walked >= budget.lines {
+                break;
+            }
+            if let Some(limit) = budget.time {
+                if walked % 64 == 0 && walked > 0 && started.elapsed() >= limit {
+                    break;
+                }
+            }
+            let range = self.line_range(line);
+            let src = &text[range];
+            let ops = parse.parse_line(src, &ps).unwrap_or_default();
+            let mut runs: Vec<(u32, u16)> = Vec::new();
+            for (style, piece) in HighlightIterator::new(&mut hstate, &ops[..], src, &highlighter) {
+                if piece.is_empty() {
+                    continue;
+                }
+                let id = self.interner.intern(StyleKey::from_syntect(&style));
+                match runs.last_mut() {
+                    Some(last) if last.1 == id => last.0 += piece.len() as u32,
+                    _ => runs.push((piece.len() as u32, id)),
+                }
+            }
+            if line >= first_missing {
+                self.lines[line].runs = Some(runs.into_boxed_slice());
+            }
+            walked += 1;
+            line += 1;
+        }
+        self.last_advance_lines += walked;
+        line < hi
     }
 
     /// Start the initial pass off-thread for a large document. The UI never
@@ -1377,6 +1457,48 @@ mod tests {
         );
         // 20 000 lines walked at this stride is 20 000 / stride checkpoints.
         assert_eq!(hl.checkpoint_count(), 20_000 / stride);
+    }
+
+    #[test]
+    fn a_range_whose_runs_were_trimmed_is_coloured_again_on_the_way_back() {
+        // Big enough that the section window cannot hold the whole document,
+        // which is what makes trimming fire at all.
+        let lines = SECTION_WINDOW_LINES * 3;
+        let mut text = String::with_capacity(lines * 24);
+        for i in 0..lines {
+            text.push_str("let x = \"s");
+            text.push_str(&(i % 97).to_string());
+            text.push_str("\"; // note\n");
+        }
+        let mut hl = DocHighlight::new("rs");
+        while hl.advance(&text, Budget::unlimited()) {}
+
+        let top = 2..10;
+        let coloured = hl.layout_job(&text, font(), Color32::GRAY, Some(top.clone()), f32::INFINITY);
+        assert!(coloured.sections.len() > top.len(), "the top was never coloured to begin with");
+
+        // Scroll far away. The next `advance` trims the top's runs, exactly as
+        // it does when the reader jumps to the end of a large file.
+        let far = lines - 10..lines - 2;
+        let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(far), f32::INFINITY);
+        while hl.advance(&text, Budget::unlimited()) {}
+
+        // Scroll back. The job asked for right after the jump may still be
+        // plain, because the refill happens in `advance`; by the next frame it
+        // has to be what the same range gave before.
+        let _ = hl.layout_job(&text, font(), Color32::GRAY, Some(top.clone()), f32::INFINITY);
+        while hl.advance(&text, Budget::unlimited()) {}
+        let again = hl.layout_job(&text, font(), Color32::GRAY, Some(top), f32::INFINITY);
+        assert_eq!(again.text, coloured.text);
+        assert_eq!(
+            again.sections.len(),
+            coloured.sections.len(),
+            "a range that came back into view lost its colour"
+        );
+        for (a, b) in again.sections.iter().zip(coloured.sections.iter()) {
+            assert_eq!(a.byte_range, b.byte_range);
+            assert_eq!(a.format.color, b.format.color);
+        }
     }
 
     #[test]
