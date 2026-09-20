@@ -2,6 +2,8 @@
 name = "the-real-explorer"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "File explorer, editor and assistant in one window"
 
 [dependencies]
 eframe = "0.29"

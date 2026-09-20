@@ -22,6 +22,39 @@ two identifier characters, or Ctrl+Space.
 
 ![Editor tab with the folder tree alongside](docs/screenshots/ide.png)
 
+A click decides for itself whether you meant to navigate or to edit, and the
+language server only starts when a file that needs it is actually opened:
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'stepAfter'}}}%%
+flowchart TD
+    Click["Click a row in the list<br/>or a name in the tree"]
+    Kind{"Folder or file?"}
+    Nav["Explorer navigates there<br/>and the tree follows"]
+    Tab["Opens as a tab in the IDE"]
+    Match{"Extension matches<br/>a configured server?"}
+    Plain["Edits with syntax colouring only"]
+    Running{"Server already running?"}
+    Start["Start it as a child process<br/>talking JSON-RPC over stdio"]
+    Reuse["Reuse the running one"]
+    Open["Send didOpen"]
+    Live["Diagnostics, completion and hover<br/>arrive on a reader thread"]
+    Click --> Kind
+    Kind -->|Folder| Nav
+    Kind -->|File| Tab
+    Tab --> Match
+    Match -->|No| Plain
+    Match -->|Yes| Running
+    Running -->|No| Start
+    Running -->|Yes| Reuse
+    Start --> Open
+    Reuse --> Open
+    Open --> Live
+```
+
+One server process is shared by every open document that maps to it, so a
+second Rust file costs nothing.
+
 Files over 64 KiB open without syntax colouring and say so in the toolbar.
 Colouring costs about a second per 250 KB and reruns on every edit, which made
 large files unusable; plain layout of the same text is far cheaper.
@@ -50,6 +83,39 @@ OpenRouter and OpenAI. Drag a file or folder from the tree onto the panel to
 attach it: Claude Code gets the paths and reads them itself, other backends get
 the contents inlined under size caps that announce every cut.
 
+The two backends diverge only in how a turn is carried and how attachments
+travel. Everything after that is shared:
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'stepAfter'}}}%%
+flowchart TD
+    Send["Type a message and press Enter"]
+    Drop["Files dragged onto the panel<br/>become attachments"]
+    Which{"Which backend?"}
+    CC["claude CLI, one process<br/>per turn, streaming JSON on stdout"]
+    Paths["Paths only; the CLI reads<br/>them itself"]
+    OA["POST to /chat/completions,<br/>server-sent events"]
+    Inline["Contents inlined under size caps,<br/>every cut announced"]
+    Worker["A worker thread parses the stream"]
+    Chan["Events cross a channel,<br/>drained once per frame"]
+    Panel["Text, tool calls, hooks and cost<br/>appear as they arrive"]
+    Send --> Which
+    Drop --> Which
+    Which -->|Claude Code| CC
+    Which -->|OpenAI-compatible| OA
+    CC --> Paths
+    OA --> Inline
+    Paths --> Worker
+    Inline --> Worker
+    Worker --> Chan
+    Chan --> Panel
+```
+
+Nothing about the panel assumes a hosted model. Point it at Ollama and the
+header shows the model you are actually talking to:
+
+![The assistant panel answering from qwen2.5-coder running locally under Ollama](docs/screenshots/local-model.png)
+
 **Agents, skills and hooks**, in their own window. It reads the same files the
 Claude Code CLI reads, in both project and user scope, and can create, open,
 reveal and delete them.
@@ -61,6 +127,30 @@ while preserving every other key and its order, writes atomically with a
 backup, and refuses to save if the file changed underneath. Test runs a hook
 with editable sample input and shows the exact command line, exit code, output
 and duration. A live feed below shows hooks actually firing during a turn.
+
+Saving is the careful part, because this is a file you also edit by hand:
+
+```mermaid
+%%{init: {'flowchart': {'curve': 'stepAfter'}}}%%
+flowchart TD
+    Pick["Pick a scope:<br/>project, project-local or user"]
+    Read["Read settings.json<br/>and remember its timestamp"]
+    Edit["Add, edit or remove hooks"]
+    Save["Save"]
+    Changed{"Changed on disk<br/>since it was read?"}
+    Refuse["Refuse, and say so.<br/>Reload takes the newer file"]
+    Bak["Write a .bak once, the first<br/>time this file is touched"]
+    Tmp["Write a temporary file<br/>and rename it into place"]
+    Kept["Every other key keeps<br/>its value and its order"]
+    Pick --> Read
+    Read --> Edit
+    Edit --> Save
+    Save --> Changed
+    Changed -->|Yes| Refuse
+    Changed -->|No| Bak
+    Bak --> Tmp
+    Tmp --> Kept
+```
 
 ![Hooks editor](docs/screenshots/hooks.png)
 
@@ -129,3 +219,7 @@ cargo test
 The test suite covers the attachment size caps, the trash operations including
 a restore round trip, the hooks round trip and the hook runner, the agent and
 skill discovery, the JSON diagnostics, and a live rust-analyzer session.
+
+## Licence
+
+MIT. Use it, change it, ship it, sell it. See [LICENSE](LICENSE).
