@@ -433,10 +433,14 @@ impl ChatPanel {
             Backend::ClaudeCode => "Claude Code".to_string(),
             Backend::OpenAiCompatible => cfg.model.clone(),
         };
+        // A max width matters: without one the panel grows to fit its widest
+        // label, and the folder path below can be long enough to squeeze the
+        // explorer list down to two columns.
         egui::SidePanel::right("chat")
             .resizable(true)
             .default_width(380.0)
             .min_width(240.0)
+            .max_width(640.0)
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.horizontal(|ui| {
@@ -459,7 +463,8 @@ impl ChatPanel {
                     // would misreport where the work is happening if the
                     // user navigated away mid-turn.
                     let shown_cwd = if self.busy { self.turn_cwd.as_ref().unwrap_or(cwd) } else { cwd };
-                    ui.small(format!("cwd: {}", shown_cwd.display()));
+                    ui.add(egui::Label::new(egui::RichText::new(format!("cwd: {}", shown_cwd.display())).small()).truncate())
+                        .on_hover_text(shown_cwd.display().to_string());
                     if let Some(usage) = self.last_usage.as_ref().and_then(TurnUsage::format) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.small(egui::RichText::new(usage).color(ui.visuals().weak_text_color()));

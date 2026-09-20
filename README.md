@@ -18,6 +18,11 @@ menus mirror the Windows 11 layout, including View, Sort by and Group by.
 Deleting goes to the recycle bin, and Ctrl+Z brings it back on Windows and
 Linux. macOS has no restore API, so there it is a one-way trip to the Trash.
 
+Any file or folder can carry a note and tags, edited in Properties, shown in a
+Note column and on hover, and matched by the filter box. They are stored in a
+hidden file in the folder, so they move with it; see Configuration for the
+details.
+
 ### Editor with language servers
 
 The centre panel switches to an IDE tab with syntax highlighting, completion,
@@ -39,9 +44,17 @@ and the current one picked out. Ctrl+G jumps to a line.
 
 ![Find in the open file](docs/screenshots/find.png)
 
-Files over 64 KiB open without syntax colouring and say so in the toolbar.
-Colouring costs about a second per 250 KB and reruns on every edit, which made
-large files unusable. Plain layout of the same text is far cheaper.
+Colouring is incremental: an edit re-parses from the line it touched until the
+parser state matches what was already known, which is usually the next line,
+so typing costs the same in a large file as in a small one. Files over
+256 KiB get their first pass on a background thread and show a progress note
+until it finishes. TypeScript, TSX and TOML are coloured alongside the usual
+set.
+
+For now the editor refuses files over 2 MiB and says so in the status line.
+egui lays the whole document out at once, which costs about 215 bytes of
+memory per character, so a file at that size already takes around 450 MB.
+Laying out only the visible lines is the next change.
 
 ### Markdown preview
 
