@@ -183,7 +183,7 @@ impl StyleKey {
             color,
             italics: self.italic,
             underline: if self.underline {
-                eframe::egui::Stroke::new(1.0, color)
+                eframe::egui::Stroke::new(1.0_f32, color)
             } else {
                 eframe::egui::Stroke::NONE
             },

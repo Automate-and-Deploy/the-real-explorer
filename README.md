@@ -211,13 +211,14 @@ with no elevation, macOS an app bundle and a dmg, Linux a deb and an AppImage.
 Windows is the development platform. macOS was tested on an Apple silicon Mac
 mini and Linux on Ubuntu 24.04, both including the installers.
 
-Two macOS gaps are known. Cmd+Q and the Quit menu item bypass the
+One macOS gap is known. Cmd+Q and the Quit menu item bypass the
 unsaved-changes guard and end the process immediately, because they call the
 application terminate path, which the windowing layer does not intercept. Use
-the window's close button, which does prompt. And the Settings and Agents
-windows currently open without the native title bar there, so they have no
-close, minimise or zoom controls. Quit the app to dismiss them until that is
-fixed.
+the window's close button, which does prompt.
+
+The Settings and Agents windows keep the native title bar on macOS, so they
+have the usual close, minimise and zoom controls, and Escape closes either
+window on every platform.
 
 Dragging out to another application is unavailable on Linux because the crate
 behind it needs a GTK application window that eframe cannot supply. The app
