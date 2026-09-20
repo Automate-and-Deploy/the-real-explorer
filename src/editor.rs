@@ -1026,6 +1026,13 @@ impl Editor {
                 PreviewKind::None => {}
             }
             ui.checkbox(&mut self.word_wrap, "Wrap");
+            if self.docs[active].text.len() > HIGHLIGHT_MAX_BYTES {
+                ui.colored_label(Color32::from_rgb(0xe0, 0xaf, 0x68), "Syntax colouring off (large file)")
+                    .on_hover_text(format!(
+                        "Highlighting costs about a second per 250 KB and reruns on every edit, so it is skipped above {} KiB.",
+                        HIGHLIGHT_MAX_BYTES / 1024
+                    ));
+            }
             if self.docs[active].read_only {
                 ui.colored_label(Color32::from_rgb(0xe0, 0xaf, 0x68), "Read-only (not valid UTF-8)");
             }
@@ -1166,8 +1173,13 @@ impl Editor {
         let find_matches_now: Vec<(usize, usize)> =
             self.find.as_ref().map(|f| find_matches(&self.docs[active].text, &f.query, f.case_insensitive)).unwrap_or_default();
         let find_current = self.find.as_ref().map(|f| f.current);
+        let highlighting = self.docs[active].text.len() <= HIGHLIGHT_MAX_BYTES;
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, text, &lang);
+            let mut job = if highlighting {
+                egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, text, &lang)
+            } else {
+                plain_job(ui, text)
+            };
             underline_diagnostics(&mut job, text, &diags);
             highlight_find_matches(&mut job, text, &find_matches_now, find_current);
             job.wrap.max_width = wrap_width;
@@ -1578,6 +1590,23 @@ fn apply_text_edits(text: &mut String, edits: &[lsp::TextEdit]) {
 }
 
 /// Add a coloured underline to every diagnostic range by splitting sections.
+/// Largest document that still gets syntax colouring.
+///
+/// Measured on this tree with `examples/hlbench.rs`: syntect runs at roughly
+/// 240 KB/s in a release build, and egui memoises the result per text value,
+/// so the whole file is re-highlighted on every keystroke. At 64 KiB that is
+/// about a quarter second, which is already the limit of tolerable; a 1 MB
+/// file took five seconds, which is what prompted the cap. Plain layout of the
+/// same text is 20-40x cheaper, so oversized files stay usable without colour.
+const HIGHLIGHT_MAX_BYTES: usize = 64 * 1024;
+
+/// Uncoloured monospace layout, used in place of syntect on large files.
+fn plain_job(ui: &egui::Ui, text: &str) -> LayoutJob {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    LayoutJob::simple(text.to_owned(), font_id, color, f32::INFINITY)
+}
+
 fn underline_diagnostics(job: &mut LayoutJob, text: &str, diags: &[Diagnostic]) {
     if diags.is_empty() {
         return;
