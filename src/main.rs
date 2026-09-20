@@ -23,7 +23,7 @@ mod theme;
 mod titlebar;
 mod trash_ops;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -115,7 +115,7 @@ impl SortKey {
     }
 }
 
-/// Result of the Properties window's background scan.
+/// Result of the Properties window's background scan, and the note editor.
 struct Props {
     path: PathBuf,
     is_dir: bool,
@@ -123,6 +123,17 @@ struct Props {
     modified: Option<SystemTime>,
     /// (bytes, files, folders) once the scan finishes.
     totals: std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64)>>>,
+    /// The folder whose sidecar holds this item's note, and the name it is
+    /// keyed by. `None` for a drive root, which has no parent to hold one.
+    home: Option<(PathBuf, String)>,
+    /// Note as typed. Saved on Save, never per keystroke.
+    note: String,
+    /// Tags as typed, comma separated.
+    tags: String,
+    /// `(note, tags)` as loaded, for Revert and for spotting an unsaved edit.
+    loaded: (String, String),
+    /// The sidecar was written by a newer build: shown, never written over.
+    read_only: bool,
 }
 
 /// Reversible actions for Ctrl+Z.
@@ -980,13 +991,114 @@ impl ExplorerApp {
             }
             *t2.lock().unwrap() = Some(acc);
         });
+        // The note lives in the parent folder's sidecar under this name, so
+        // the window reads it from there rather than from the cached listing:
+        // Properties is reachable from the tree and from the address bar too,
+        // where the item is not a row in the current folder at all.
+        let home = path
+            .parent()
+            .zip(path.file_name())
+            .map(|(d, n)| (d.to_path_buf(), n.to_string_lossy().into_owned()));
+        let mut note = String::new();
+        let mut tags = String::new();
+        let mut read_only = false;
+        if let Some((dir, key)) = &home {
+            match meta::load(dir) {
+                Ok(Some(m)) => {
+                    read_only = m.is_read_only();
+                    if let Some(i) = m.items.get(key) {
+                        note = i.note.clone();
+                        tags = meta::tags_line(&i.tags);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.status = e,
+            }
+        }
         self.props = Some(Props {
             path,
             is_dir,
             created: md.as_ref().and_then(|m| m.created().ok()),
             modified: md.and_then(|m| m.modified().ok()),
             totals,
+            home,
+            loaded: (note.clone(), tags.clone()),
+            note,
+            tags,
+            read_only,
         });
+    }
+
+    /// Load the sidecar for `dir`, let `edit` change it, and write it back
+    /// when `edit` reports a change.
+    ///
+    /// Entries whose name is no longer in the folder are dropped at the same
+    /// time, but only when the folder could actually be listed: pruning
+    /// against a transient read error would delete every note in it.
+    ///
+    /// `create` is false for the rename, delete and paste hooks. Renaming a
+    /// file in a folder nobody has annotated must not conjure a sidecar into
+    /// it, and it must not cost a write either.
+    fn edit_meta(
+        &mut self,
+        dir: &Path,
+        create: bool,
+        edit: impl FnOnce(&mut meta::FolderMeta) -> bool,
+    ) -> Result<bool, String> {
+        let mut m = match meta::load(dir)? {
+            Some(m) => m,
+            None if create => meta::FolderMeta::default(),
+            None => return Ok(false),
+        };
+        if !edit(&mut m) {
+            return Ok(false);
+        }
+        if let Ok(rd) = fs::read_dir(dir) {
+            let present: HashSet<String> =
+                rd.flatten().map(|de| de.file_name().to_string_lossy().into_owned()).collect();
+            m.prune(&present);
+        }
+        meta::save(dir, &m)?;
+        self.invalidate_meta();
+        Ok(true)
+    }
+
+    /// Write the Properties window's note and tags into the sidecar.
+    ///
+    /// A failure leaves the typed text exactly where it is: the window stays
+    /// open with the note still in it and the status line says why, because
+    /// the folder being unwritable is not the user's mistake to lose work to.
+    fn save_item_meta(&mut self, p: &mut Props) {
+        let Some((dir, key)) = p.home.clone() else { return };
+        let note = meta::normalize_note(&p.note);
+        let tags = meta::normalize_tags(&p.tags);
+        let (n, t) = (note.clone(), tags.clone());
+        let k = key.clone();
+        let r = self.edit_meta(&dir, true, move |m| {
+            let drop_it = {
+                let item = m.items.entry(k.clone()).or_default();
+                item.note = n;
+                item.tags = t;
+                item.updated = meta::now();
+                // Clearing both fields removes the entry rather than leaving
+                // an empty record, unless another writer's keys are on it.
+                item.is_empty()
+            };
+            if drop_it {
+                m.items.remove(&k);
+            }
+            true
+        });
+        match r {
+            Ok(_) => {
+                p.tags = meta::tags_line(&tags);
+                p.note = note;
+                p.loaded = (p.note.clone(), p.tags.clone());
+                self.reload();
+                self.status = format!("Note saved in {}", meta::path(&dir).display());
+            }
+            Err(e) => self.status = format!("Note not saved: {e}"),
+        }
     }
 
     /// Apply a confirmed modal action.
@@ -1752,8 +1864,17 @@ impl ExplorerApp {
         }
     }
 
+    /// The Properties window, which also edits the note and tags.
+    ///
+    /// `Props` is taken out of `self` for the duration: the text fields need
+    /// `&mut` on it while the closure runs, and Save needs `&mut self`, which
+    /// the closure cannot have. Both are applied after the closure has
+    /// returned, the same way the paste-conflict and exit-guard windows defer
+    /// their decisions.
     fn properties_window(&mut self, ctx: &egui::Context) {
-        let Some(p) = &self.props else { return };
+        let Some(mut p) = self.props.take() else { return };
+        let mut save = false;
+        let mut revert = false;
         let mut open = true;
         let name = p
             .path
@@ -1813,9 +1934,56 @@ impl ExplorerApp {
                         let _ = platform::native_properties(&p.path);
                     }
                 });
+                ui.separator();
+                match &p.home {
+                    Some((dir, _)) => {
+                        let store = meta::path(dir);
+                        ui.label("Note");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut p.note)
+                                .desired_width(360.0)
+                                .desired_rows(3)
+                                .hint_text("What this folder is for"),
+                        );
+                        ui.label("Tags");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut p.tags)
+                                .desired_width(360.0)
+                                .hint_text("comma, separated"),
+                        );
+                        if p.read_only {
+                            ui.small(format!(
+                                "{} was written by a newer version. It is shown here but not written over.",
+                                store.display()
+                            ));
+                        }
+                        let edited = (p.note.as_str(), p.tags.as_str()) != (p.loaded.0.as_str(), p.loaded.1.as_str());
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(edited && !p.read_only, egui::Button::new("Save")).clicked() {
+                                save = true;
+                            }
+                            if ui.add_enabled(edited, egui::Button::new("Revert")).clicked() {
+                                revert = true;
+                            }
+                        });
+                        ui.small(format!("Kept in {}", store.display()));
+                    }
+                    // Annotating a drive root would need a sidecar in a folder
+                    // above it, and there is none.
+                    None => {
+                        ui.small("A drive root cannot carry a note.");
+                    }
+                }
             });
-        if !open {
-            self.props = None;
+        if revert {
+            p.note = p.loaded.0.clone();
+            p.tags = p.loaded.1.clone();
+        }
+        if save {
+            self.save_item_meta(&mut p);
+        }
+        if open {
+            self.props = Some(p);
         }
     }
 
