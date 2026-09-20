@@ -2,3 +2,6 @@
 
 # packaging output
 /dist
+
+# per-project UI settings this app writes for whoever opens the repo in it
+/.code

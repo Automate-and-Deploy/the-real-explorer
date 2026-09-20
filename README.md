@@ -20,12 +20,23 @@ syntax highlighting, completion, hover documentation and live diagnostics from
 any language server on your machine. Completion triggers on `.`, `::`, after
 two identifier characters, or Ctrl+Space.
 
+![Editor tab with the folder tree alongside](docs/screenshots/ide.png)
+
+Files over 64 KiB open without syntax colouring and say so in the toolbar.
+Colouring costs about a second per 250 KB and reruns on every edit, which made
+large files unusable; plain layout of the same text is far cheaper.
+
 ![Editor with completion from rust-analyzer](docs/screenshots/completion.png)
 
 Servers are configured per file extension in Settings, with rust-analyzer,
 typescript-language-server, pyright, gopls, clangd and others as defaults. One
 that is not installed is silent: the editor still works, and Settings marks it
 as not found.
+
+Ctrl+F finds in the open file and Ctrl+H replaces, with every match highlighted
+and the current one picked out. Ctrl+G jumps to a line.
+
+![Find in the open file](docs/screenshots/find.png)
 
 **Markdown preview**, and HTML opens in your browser. JSON has a formatter on
 Ctrl+Shift+F, runs on save, and gets syntax error underlines with no server
@@ -102,7 +113,8 @@ plain text.
 ## Themes
 
 System, light, dark, and Omarchy, which is the Tokyo Night palette in
-monospace with flat edges. The screenshots above are Omarchy.
+monospace with flat edges. The screenshots above are Omarchy, taken against a
+small sample project rather than a real one.
 
 ## Building
 
