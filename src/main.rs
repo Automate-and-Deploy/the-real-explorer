@@ -1433,18 +1433,27 @@ impl ExplorerApp {
         // Only the list area, not the tab strip above it.
         let pane = ui.available_rect_before_wrap();
 
-        TableBuilder::new(ui)
+        // A folder nobody has annotated looks exactly as it did before.
+        let show_note = self.has_notes();
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::initial(90.0).at_least(60.0))
             .column(Column::initial(150.0).at_least(100.0))
-            .column(Column::initial(90.0).at_least(60.0))
+            .column(Column::initial(90.0).at_least(60.0));
+        if show_note {
+            table = table.column(Column::initial(200.0).at_least(80.0).clip(true));
+        }
+        table
             .header(22.0, |mut h| {
                 h.col(|ui| if header(ui, "Name", SortKey::Name, self) { sort = Some(SortKey::Name) });
                 h.col(|ui| if header(ui, "Size", SortKey::Size, self) { sort = Some(SortKey::Size) });
                 h.col(|ui| if header(ui, "Modified", SortKey::Modified, self) { sort = Some(SortKey::Modified) });
                 h.col(|ui| { ui.strong("Type"); });
+                if show_note {
+                    h.col(|ui| { ui.strong("Note"); });
+                }
             })
             .body(|body| {
                 body.rows(if self.compact { 18.0 } else { 24.0 }, entries.len(), |mut row| {
@@ -1458,7 +1467,19 @@ impl ExplorerApp {
                         let mut job = egui::text::LayoutJob::default();
                         job.append(&format!("{glyph} "), 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
                         job.append(&e.name, 0.0, egui::TextFormat { font_id: font, color: ui.visuals().text_color(), ..Default::default() });
-                        ui.add(egui::Label::new(job).truncate());
+                        let resp = ui.add(egui::Label::new(job).truncate());
+                        // `contains_pointer`, not `hovered`: the catch-all
+                        // interact registered over the whole pane after the
+                        // rows is the topmost widget, so nothing inside a row
+                        // is ever the hovered one.
+                        if !e.note.is_empty() && resp.contains_pointer() {
+                            egui::show_tooltip_at_pointer(
+                                ui.ctx(),
+                                ui.layer_id(),
+                                egui::Id::new("note-tooltip"),
+                                |ui| ui.label(&e.note),
+                            );
+                        }
                     });
                     row.col(|ui| {
                         if e.is_dir {
@@ -1475,6 +1496,29 @@ impl ExplorerApp {
                     row.col(|ui| {
                         ui.label(if e.is_dir { "Folder".to_string() } else { ext_type(&e.name) });
                     });
+                    if show_note {
+                        row.col(|ui| {
+                            if e.note.is_empty() && e.tags.is_empty() {
+                                return;
+                            }
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let mut job = egui::text::LayoutJob::default();
+                            // A multi-line note would push the row past its
+                            // fixed height, so the cell shows it on one line
+                            // and the hover on the name shows the whole thing.
+                            let one_line = e.note.replace(['\r', '\n'], " ");
+                            job.append(&one_line, 0.0, egui::TextFormat { font_id: font.clone(), color: ui.visuals().text_color(), ..Default::default() });
+                            if !e.tags.is_empty() {
+                                let tags: Vec<String> = e.tags.iter().map(|t| format!("#{t}")).collect();
+                                job.append(
+                                    &format!(" {}", tags.join(" ")),
+                                    0.0,
+                                    egui::TextFormat { font_id: font, color: ui.visuals().weak_text_color(), ..Default::default() },
+                                );
+                            }
+                            ui.add(egui::Label::new(job).truncate());
+                        });
+                    }
                     let r = row.response();
                     if r.contains_pointer() {
                         hovered_row = Some(i);
