@@ -196,6 +196,10 @@ pub struct Editor {
     find: Option<FindState>,
     /// Ctrl+G bar text, while open.
     goto_line: Option<String>,
+    /// Focus the goto field on the frame after it opens, once. Requesting
+    /// focus every frame kept the field from ever reporting `lost_focus`, so
+    /// Enter did nothing and only the Go button worked.
+    goto_focus: bool,
     /// A char index a find/replace jump or a goto-line asked the text area to
     /// scroll to, consumed the next time the body is drawn.
     pending_scroll_to: Option<usize>,
@@ -237,6 +241,7 @@ impl Editor {
             word_wrap: false,
             find: None,
             goto_line: None,
+            goto_focus: false,
             pending_scroll_to: None,
             pending_close: None,
             // Backdated so the very first frame already checks once, instead
@@ -1015,8 +1020,12 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.label("Go to line:");
             let resp = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(80.0));
-            resp.request_focus();
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if self.goto_focus {
+                resp.request_focus();
+                self.goto_focus = false;
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if enter && (resp.has_focus() || resp.lost_focus()) {
                 go = true;
             }
             if ui.small_button("Go").clicked() {
@@ -1037,6 +1046,9 @@ impl Editor {
                     self.pending_scroll_to = Some(idx);
                     self.cursor_char = idx;
                     self.status = format!("Line {line}");
+                    // The scroll target is applied by the next frame, which
+                    // nothing else asks for after a keyboard jump.
+                    ctx.request_repaint();
                 }
                 _ => self.status = "Go to line: enter a line number".into(),
             }
@@ -1079,6 +1091,7 @@ impl Editor {
         egui::TextEdit::store_state(ctx, edit_id, state);
         self.pending_scroll_to = Some(s);
         self.cursor_char = s;
+        ctx.request_repaint();
     }
 
     fn show_close_confirm(&mut self, ctx: &egui::Context, i: usize, format_json_on_save: bool) {
@@ -1357,6 +1370,7 @@ impl Editor {
         if toggle_goto {
             self.find = None;
             self.goto_line = Some(String::new());
+            self.goto_focus = true;
         }
         if find_next {
             self.step_match(false);
@@ -1439,7 +1453,12 @@ impl Editor {
             ui.fonts(|f| f.layout_job(job))
         };
 
-        egui::ScrollArea::vertical()
+        // One scroll area for both axes. A horizontal area nested inside a
+        // vertical one takes the vertical scroll target too (egui does that on
+        // purpose so targets never leak between siblings) and drops it, which
+        // left find, go-to-line and even Ctrl+End unable to scroll with wrap off.
+        let editor_scroll = if self.word_wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+        editor_scroll
             .id_salt(("editor-vscroll", active))
             .auto_shrink([false, false])
             .max_height(available_height)
@@ -1482,7 +1501,8 @@ impl Editor {
                             d.last_text = d.text.clone();
                         }
                         if let Some(idx) = self.pending_scroll_to.take() {
-                            let rect = out.galley.pos_from_ccursor(egui::text::CCursor::new(idx));
+                            // `pos_from_ccursor` is galley-local; the scroll area wants screen space.
+                            let rect = out.galley.pos_from_ccursor(egui::text::CCursor::new(idx)).translate(out.galley_pos.to_vec2());
                             ui.scroll_to_rect(rect, Some(egui::Align::Center));
                         }
                         if let Some((pointer_pos, char_idx)) =
@@ -1501,7 +1521,7 @@ impl Editor {
                             }
                         }
                     } else {
-                        egui::ScrollArea::horizontal().id_salt(("editor-hscroll", active)).auto_shrink([false, false]).show(ui, |ui| {
+                        {
                             let d = &mut self.docs[active];
                             let out = egui::TextEdit::multiline(&mut d.text)
                                 .id(edit_id)
@@ -1532,7 +1552,8 @@ impl Editor {
                                 d.last_text = d.text.clone();
                             }
                             if let Some(idx) = self.pending_scroll_to.take() {
-                                let rect = out.galley.pos_from_ccursor(egui::text::CCursor::new(idx));
+                                // `pos_from_ccursor` is galley-local; the scroll area wants screen space.
+                                let rect = out.galley.pos_from_ccursor(egui::text::CCursor::new(idx)).translate(out.galley_pos.to_vec2());
                                 ui.scroll_to_rect(rect, Some(egui::Align::Center));
                             }
                             if let Some((pointer_pos, char_idx)) =
@@ -1550,7 +1571,7 @@ impl Editor {
                                     }
                                 }
                             }
-                        });
+                        }
                     }
                 });
             });
