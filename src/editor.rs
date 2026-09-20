@@ -23,11 +23,21 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, text::LayoutJob, Color32, Key, Modifiers};
 
 use crate::lsp::{self, CompletionItem, Diagnostic, LspClient, LspEvent, ServerDef};
+use crate::textpos::{find_matches, replace_all, LineIndex};
 
-/// Files larger than this are refused at open rather than read synchronously
-/// onto the UI thread; egui's `TextEdit` and the syntax layouter re-walk the
-/// whole buffer every frame, so anything much bigger stalls the app.
-const MAX_OPEN_BYTES: u64 = 8 * 1024 * 1024;
+/// Files larger than this are refused at open.
+///
+/// egui lays the whole buffer into one galley and keeps a pre-reserved mesh
+/// for every glyph, measured at about 215 bytes of memory per character on
+/// this app: a 5.8 MB file cost 1.25 GB. Until the editor lays out only the
+/// visible lines, 2 MiB keeps the worst case near 450 MB. The cap goes back
+/// up when that lands.
+const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Largest markdown document the preview will render. The preview is a
+/// separate whole-document renderer with the same per-glyph cost as the
+/// editor, and nothing else bounds it.
+const PREVIEW_MAX_BYTES: usize = 512 * 1024;
 
 /// How long the pointer must rest in one spot before hover fires on its own,
 /// separate from the explicit Ctrl+K request.
@@ -36,6 +46,11 @@ const HOVER_DWELL_MS: u64 = 500;
 pub struct Doc {
     pub path: PathBuf,
     pub text: String,
+    /// Line start offsets in bytes and chars, so cursor, LSP and byte
+    /// positions convert without walking the text. Rebuilt by
+    /// `text_replaced` after every edit; stale for exactly the span between
+    /// an edit and that call, which is why every splice ends with it.
+    pub lines: LineIndex,
     /// Copy of `text` from last frame, to detect edits made by the widget.
     last_text: String,
     pub version: i64,
@@ -56,6 +71,14 @@ pub struct Doc {
     /// The file had a UTF-8 BOM at open; `text` never carries it (parsers
     /// choke on it) but it is written back on save.
     has_bom: bool,
+}
+
+impl Doc {
+    /// Recompute the line index after `text` changed. One pass over the
+    /// bytes; every edit path calls it so nothing reads a stale index.
+    fn text_replaced(&mut self) {
+        self.lines = LineIndex::build(&self.text);
+    }
 }
 
 struct Completion {
@@ -159,17 +182,20 @@ impl Editor {
 
     /// Open (or focus) a file. Starts the matching language server on demand,
     /// rooted at `root` (the explorer's current folder or a detected project).
-    pub fn open(&mut self, path: &Path, root: &Path, servers: &[ServerDef]) {
+    /// Open `path` in a tab, or focus its tab if it already has one.
+    /// Returns false when nothing was opened (unreadable, over the size cap),
+    /// so the caller does not switch to an editor with nothing in it.
+    pub fn open(&mut self, path: &Path, root: &Path, servers: &[ServerDef]) -> bool {
         if let Some(i) = self.docs.iter().position(|d| d.path == path) {
             self.active = i;
             self.focus_next = true;
-            return;
+            return true;
         }
         let meta = match fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 self.status = format!("Cannot open {}: {e}", path.display());
-                return;
+                return false;
             }
         };
         if exceeds_cap(meta.len()) {
@@ -179,13 +205,13 @@ impl Editor {
                 meta.len() as f64 / (1024.0 * 1024.0),
                 MAX_OPEN_BYTES / (1024 * 1024),
             );
-            return;
+            return false;
         }
         let (text, has_bom, read_only) = match load_file(path) {
             Ok(v) => v,
             Err(e) => {
                 self.status = format!("Cannot open {}: {e}", path.display());
-                return;
+                return false;
             }
         };
         if read_only {
@@ -195,6 +221,7 @@ impl Editor {
         let def = servers.iter().find(|s| s.extensions.iter().any(|x| *x == ext)).cloned();
         let mut doc = Doc {
             path: path.to_path_buf(),
+            lines: LineIndex::build(&text),
             text: text.clone(),
             last_text: text.clone(),
             version: 0,
@@ -241,6 +268,7 @@ impl Editor {
         self.docs.push(doc);
         self.active = self.docs.len() - 1;
         self.focus_next = true;
+        true
     }
 
     /// Removes a tab unconditionally. Called once the caller has already
@@ -311,6 +339,7 @@ impl Editor {
         out.push('\n');
         if out != d.text {
             d.text = out.clone();
+            d.text_replaced();
             d.last_text = out;
             d.dirty = true;
             d.version += 1;
@@ -448,6 +477,7 @@ impl Editor {
                 Ok((text, has_bom, read_only)) => {
                     let d = &mut self.docs[i];
                     d.text = text.clone();
+                    d.text_replaced();
                     d.last_text = text;
                     d.has_bom = has_bom;
                     d.read_only = read_only;
@@ -493,6 +523,7 @@ impl Editor {
                 let meta = fs::metadata(&path).ok();
                 if let Some(d) = self.docs.get_mut(i) {
                     d.text = text.clone();
+                    d.text_replaced();
                     d.last_text = text.clone();
                     d.has_bom = has_bom;
                     d.read_only = read_only;
@@ -572,6 +603,7 @@ impl Editor {
                                     self.status = "Format reply arrived but the file is read-only; discarded".into();
                                 } else {
                                     apply_text_edits(&mut d.text, &edits);
+                                    d.text_replaced();
                                     d.last_text = d.text.clone();
                                     d.dirty = true;
                                     d.version += 1;
@@ -594,18 +626,22 @@ impl Editor {
     /// Char index where the identifier under the cursor begins.
     fn prefix_start(&self) -> usize {
         let Some(d) = self.docs.get(self.active) else { return 0 };
-        let chars: Vec<char> = d.text.chars().collect();
-        let mut i = self.cursor_char.min(chars.len());
-        while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        let c = self.cursor_char.min(d.lines.char_count());
+        let line = d.lines.line_of_char(c);
+        let line_char0 = d.lines.line_char_start(line);
+        let within = c - line_char0;
+        let prefix: Vec<char> = d.text[d.lines.line_byte_start(line)..].chars().take(within).collect();
+        let mut i = prefix.len();
+        while i > 0 && (prefix[i - 1].is_alphanumeric() || prefix[i - 1] == '_') {
             i -= 1;
         }
-        i
+        line_char0 + i
     }
 
     fn request_completion(&mut self) {
         let Some(d) = self.docs.get(self.active) else { return };
         let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) else { return };
-        let (line, col) = char_to_lsp(&d.text, self.cursor_char);
+        let (line, col) = d.lines.char_to_lsp(&d.text, self.cursor_char);
         let id = c.completion(&d.path, line, col);
         self.pending_completion = Some(id);
     }
@@ -617,14 +653,17 @@ impl Editor {
         if d.read_only {
             return;
         }
-        let chars: Vec<char> = d.text.chars().collect();
-        let at = self.cursor_char.min(chars.len());
-        let insert = newline_indent(&chars[..at]);
-        let mut next: String = chars[..at].iter().collect();
-        next.push_str(&insert);
-        let cursor = next.chars().count();
-        next.extend(chars[at..].iter());
-        d.text = next;
+        let at_c = self.cursor_char.min(d.lines.char_count());
+        let at = d.lines.char_to_byte(&d.text, at_c);
+        // `newline_indent` only looks back to the start of the current line,
+        // so handing it that line's prefix gives the same answer as the whole
+        // text did, without copying the whole text.
+        let line0 = d.lines.line_byte_start(d.lines.line_of_char(at_c));
+        let line_prefix: Vec<char> = d.text[line0..at].chars().collect();
+        let insert = newline_indent(&line_prefix);
+        d.text.insert_str(at, &insert);
+        let cursor = at_c + insert.chars().count();
+        d.text_replaced();
         let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
         state
             .cursor
@@ -637,20 +676,19 @@ impl Editor {
         let Some(comp) = self.completion.take() else { return };
         let Some(item) = comp.items.get(comp.selected) else { return };
         let Some(d) = self.docs.get_mut(self.active) else { return };
-        let chars: Vec<char> = d.text.chars().collect();
-        let start = comp.prefix_start.min(chars.len());
-        let end = self.cursor_char.min(chars.len());
+        let start = comp.prefix_start.min(d.lines.char_count());
+        let end = self.cursor_char.min(d.lines.char_count());
         // The prefix start was recorded when the list arrived. If the caret has
-        // since moved before it, splicing the two slices would duplicate the
-        // text between them rather than replace it.
+        // since moved before it, splicing would duplicate the text between
+        // them rather than replace it.
         if end < start {
             return;
         }
-        let mut new_text: String = chars[..start].iter().collect();
-        new_text.push_str(&item.insert_text);
-        let new_cursor = new_text.chars().count();
-        new_text.extend(chars[end..].iter());
-        d.text = new_text;
+        let sb = d.lines.char_to_byte(&d.text, start);
+        let eb = d.lines.char_to_byte(&d.text, end);
+        d.text.replace_range(sb..eb, &item.insert_text);
+        let new_cursor = start + item.insert_text.chars().count();
+        d.text_replaced();
         // Move the widget's cursor to the end of the inserted text.
         let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
         state
@@ -710,11 +748,8 @@ impl Editor {
         }
         let matches = find_matches(&d.text, &query, ci);
         let Some(&(s, e)) = matches.get(current) else { return };
-        let chars: Vec<char> = d.text.chars().collect();
-        let mut new_text: String = chars[..s].iter().collect();
-        new_text.push_str(&replacement);
-        new_text.extend(chars[e..].iter());
-        d.text = new_text;
+        d.text.replace_range(s..e, &replacement);
+        d.text_replaced();
         d.last_text = d.text.clone();
         d.dirty = true;
         d.version += 1;
@@ -748,6 +783,7 @@ impl Editor {
             return;
         }
         d.text = new_text;
+        d.text_replaced();
         d.last_text = d.text.clone();
         d.dirty = true;
         d.version += 1;
@@ -854,7 +890,7 @@ impl Editor {
         if go {
             match buf.trim().parse::<usize>() {
                 Ok(line) if line >= 1 => {
-                    let idx = line_start_char(&self.docs[active].text, line);
+                    let idx = self.docs[active].lines.line_char_start(line - 1);
                     let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
                     state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(idx))));
                     egui::TextEdit::store_state(ctx, edit_id, state);
@@ -892,7 +928,10 @@ impl Editor {
         if let Some(f) = &mut self.find {
             f.current = current;
         }
-        let (s, e) = matches[current];
+        let (sb, eb) = matches[current];
+        let d = &self.docs[active];
+        let s = d.lines.byte_to_char(&d.text, sb);
+        let e = d.lines.byte_to_char(&d.text, eb);
         let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
         state
             .cursor
@@ -1045,6 +1084,14 @@ impl Editor {
         ui.separator();
 
         if self.preview && kind == PreviewKind::Markdown {
+            if self.docs[active].text.len() > PREVIEW_MAX_BYTES {
+                ui.label(format!(
+                    "Preview is off for files over {} KiB; this one is {} KiB.",
+                    PREVIEW_MAX_BYTES / 1024,
+                    self.docs[active].text.len() / 1024
+                ));
+                return;
+            }
             let text = self.docs[active].text.clone();
             egui::ScrollArea::vertical()
                 .id_salt(("md-preview", active))
@@ -1169,7 +1216,10 @@ impl Editor {
         // ---- editor body ----
         let lang = self.docs[active].path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(&ctx, ui.style());
-        let diags = self.docs[active].diagnostics.clone();
+        let diag_ranges = {
+            let d = &self.docs[active];
+            diagnostic_ranges(&d.lines, &d.text, &d.diagnostics)
+        };
         let find_matches_now: Vec<(usize, usize)> =
             self.find.as_ref().map(|f| find_matches(&self.docs[active].text, &f.query, f.case_insensitive)).unwrap_or_default();
         let find_current = self.find.as_ref().map(|f| f.current);
@@ -1180,8 +1230,8 @@ impl Editor {
             } else {
                 plain_job(ui, text)
             };
-            underline_diagnostics(&mut job, text, &diags);
-            highlight_find_matches(&mut job, text, &find_matches_now, find_current);
+            underline_ranges(&mut job, &diag_ranges);
+            highlight_find_matches(&mut job, &find_matches_now, find_current);
             job.wrap.max_width = wrap_width;
             ui.fonts(|f| f.layout_job(job))
         };
@@ -1207,7 +1257,7 @@ impl Editor {
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     if show_gutter {
-                        let line_count = self.docs[active].text.matches('\n').count() + 1;
+                        let line_count = self.docs[active].lines.line_count();
                         line_number_gutter(ui, line_count, row_height);
                     }
                     if self.word_wrap {
@@ -1232,10 +1282,11 @@ impl Editor {
                             cursor_pos = Some(galley_pos + rect.left_bottom().to_vec2());
                         }
                         let d = &mut self.docs[active];
-                        if d.text != d.last_text {
+                        if out.response.changed() {
                             text_changed = true;
                             d.dirty = true;
                             d.version += 1;
+                            d.text_replaced();
                             d.last_text = d.text.clone();
                         }
                         if let Some(idx) = self.pending_scroll_to.take() {
@@ -1246,7 +1297,7 @@ impl Editor {
                             hover_dwell_fired(&out.response, &out.galley, galley_pos, &mut self.hover_watch, &mut self.hover_requested_for)
                         {
                             let d = &self.docs[active];
-                            let (line, col) = char_to_lsp(&d.text, char_idx);
+                            let (line, col) = d.lines.char_to_lsp(&d.text, char_idx);
                             let path = d.path.clone();
                             let server = d.server.clone();
                             if let Some(name) = server {
@@ -1279,10 +1330,11 @@ impl Editor {
                                 cursor_pos = Some(galley_pos + rect.left_bottom().to_vec2());
                             }
                             let d = &mut self.docs[active];
-                            if d.text != d.last_text {
+                            if out.response.changed() {
                                 text_changed = true;
                                 d.dirty = true;
                                 d.version += 1;
+                                d.text_replaced();
                                 d.last_text = d.text.clone();
                             }
                             if let Some(idx) = self.pending_scroll_to.take() {
@@ -1293,7 +1345,7 @@ impl Editor {
                                 hover_dwell_fired(&out.response, &out.galley, galley_pos, &mut self.hover_watch, &mut self.hover_requested_for)
                             {
                                 let d = &self.docs[active];
-                                let (line, col) = char_to_lsp(&d.text, char_idx);
+                                let (line, col) = d.lines.char_to_lsp(&d.text, char_idx);
                                 let path = d.path.clone();
                                 let server = d.server.clone();
                                 if let Some(name) = server {
@@ -1322,8 +1374,10 @@ impl Editor {
             if let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) {
                 c.did_change(&path, version, &text);
             }
-            let chars: Vec<char> = text.chars().collect();
-            let prev = self.cursor_char.checked_sub(1).and_then(|i| chars.get(i)).copied();
+            let prev = self.cursor_char.checked_sub(1).map(|i| {
+                let b = d.lines.char_to_byte(&text, i);
+                text[b..].chars().next()
+            }).flatten();
             let trigger = matches!(prev, Some('.') | Some(':'));
             let ident = prev.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
             if trigger || (ident && (self.completion.is_some() || self.prefix_len() >= 2)) {
@@ -1337,7 +1391,7 @@ impl Editor {
         }
         if hover_req {
             let d = &self.docs[active];
-            let (line, col) = char_to_lsp(&d.text, self.cursor_char);
+            let (line, col) = d.lines.char_to_lsp(&d.text, self.cursor_char);
             let path = d.path.clone();
             if let Some(c) = d.server.as_ref().and_then(|s| self.servers.get_mut(s)) {
                 let id = c.hover(&path, line, col);
@@ -1349,10 +1403,12 @@ impl Editor {
         // ---- completion popup ----
         if let (Some(comp), Some(pos)) = (&mut self.completion, cursor_pos) {
             let prefix: String = {
-                let chars: Vec<char> = self.docs[active].text.chars().collect();
-                let s = comp.prefix_start.min(chars.len());
-                let e = self.cursor_char.min(chars.len()).max(s);
-                chars[s..e].iter().collect::<String>().to_lowercase()
+                let d = &self.docs[active];
+                let s = comp.prefix_start.min(d.lines.char_count());
+                let e = self.cursor_char.min(d.lines.char_count()).max(s);
+                let sb = d.lines.char_to_byte(&d.text, s);
+                let eb = d.lines.char_to_byte(&d.text, e);
+                d.text[sb..eb].to_lowercase()
             };
             let visible: Vec<usize> = comp
                 .items
@@ -1481,20 +1537,33 @@ fn hover_dwell_fired(
 }
 
 /// Line-number gutter. Only shown with word wrap off; see the caveat where
-/// `show_gutter` is computed in `Editor::show`. Performance note: this walks
-/// the whole line count and lays out one label per line every frame, which
-/// is no worse than the syntax layouter already re-highlighting the whole
-/// buffer every frame, so it does not newly bound file size below the
-/// existing 8 MiB open cap.
+/// `show_gutter` is computed in `Editor::show`.
+///
+/// Reserves the full height so the scroll range matches the text, but lays
+/// out one galley holding only the rows inside the clip rect. The previous
+/// version added a label widget per source line every frame, and egui kept
+/// every one of those galleys alive, which on a 90 000 line file was about
+/// 125 MB for numbers nobody could see.
 fn line_number_gutter(ui: &mut egui::Ui, line_count: usize, row_height: f32) {
     let width = (line_count.max(1).to_string().len().max(3) as f32) * 7.5 + 10.0;
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.set_width(width);
-        for line in 1..=line_count {
-            ui.add_sized([width, row_height], egui::Label::new(egui::RichText::new(line.to_string()).monospace().weak()));
-        }
-    });
+    let total = egui::vec2(width, line_count as f32 * row_height);
+    let (rect, _) = ui.allocate_exact_size(total, egui::Sense::hover());
+    let clip = ui.clip_rect();
+    let first = ((clip.top() - rect.top()) / row_height).floor().max(0.0) as usize;
+    let last = ((((clip.bottom() - rect.top()) / row_height).ceil().max(0.0) as usize) + 1).min(line_count);
+    if first >= last {
+        return;
+    }
+    let mut numbers = String::with_capacity((last - first) * 8);
+    for line in first + 1..=last {
+        numbers.push_str(&line.to_string());
+        numbers.push('\n');
+    }
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let color = ui.visuals().weak_text_color();
+    let galley = ui.fonts(|f| f.layout(numbers, font, color, f32::INFINITY));
+    let pos = egui::pos2(rect.left() + 5.0, rect.top() + first as f32 * row_height);
+    ui.painter().galley(pos, galley, color);
 }
 
 /// Walk up from the file looking for a project marker the server cares about
@@ -1528,49 +1597,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Char index -> (line, UTF-16 column).
-fn char_to_lsp(text: &str, idx: usize) -> (u32, u32) {
-    let mut line = 0u32;
-    let mut col = 0u32;
-    for (i, c) in text.chars().enumerate() {
-        if i == idx {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += c.len_utf16() as u32;
-        }
-    }
-    (line, col)
-}
-
-/// (line, UTF-16 column) -> byte offset, clamped to the text.
-fn lsp_to_byte(text: &str, line: u32, col: u32) -> usize {
-    let mut cur_line = 0u32;
-    let mut cur_col = 0u32;
-    for (b, c) in text.char_indices() {
-        if cur_line == line && cur_col >= col {
-            return b;
-        }
-        if c == '\n' {
-            if cur_line == line {
-                return b;
-            }
-            cur_line += 1;
-            cur_col = 0;
-        } else if cur_line == line {
-            cur_col += c.len_utf16() as u32;
-        }
-    }
-    text.len()
-}
-
-/// Char index -> byte offset, clamped to the text.
-fn char_to_byte(text: &str, idx: usize) -> usize {
-    text.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(text.len())
-}
-
 /// Applies LSP `TextEdit`s to `text` in place. LSP formatting edits describe
 /// positions against the *original* document, so they are applied back to
 /// front: once the first (latest) splice happens, byte offsets computed
@@ -1579,9 +1605,12 @@ fn char_to_byte(text: &str, idx: usize) -> usize {
 fn apply_text_edits(text: &mut String, edits: &[lsp::TextEdit]) {
     let mut ordered: Vec<&lsp::TextEdit> = edits.iter().collect();
     ordered.sort_by(|a, b| (b.start_line, b.start_col).cmp(&(a.start_line, a.start_col)));
+    // Back-to-front application keeps every earlier offset valid, so one
+    // index built from the original text serves every edit.
+    let ix = LineIndex::build(text);
     for e in ordered {
-        let s = lsp_to_byte(text, e.start_line, e.start_col);
-        let mut end = lsp_to_byte(text, e.end_line, e.end_col);
+        let s = ix.lsp_to_byte(text, e.start_line, e.start_col);
+        let mut end = ix.lsp_to_byte(text, e.end_line, e.end_col);
         if end < s {
             end = s;
         }
@@ -1589,7 +1618,6 @@ fn apply_text_edits(text: &mut String, edits: &[lsp::TextEdit]) {
     }
 }
 
-/// Add a coloured underline to every diagnostic range by splitting sections.
 /// Largest document that still gets syntax colouring.
 ///
 /// Measured on this tree with `examples/hlbench.rs`: syntect runs at roughly
@@ -1607,15 +1635,14 @@ fn plain_job(ui: &egui::Ui, text: &str) -> LayoutJob {
     LayoutJob::simple(text.to_owned(), font_id, color, f32::INFINITY)
 }
 
-fn underline_diagnostics(job: &mut LayoutJob, text: &str, diags: &[Diagnostic]) {
-    if diags.is_empty() {
-        return;
-    }
-    let ranges: Vec<(usize, usize, Color32)> = diags
+/// Diagnostic spans as byte ranges with their severity colour. Computed once
+/// per frame from the line index; the layouter only applies them.
+fn diagnostic_ranges(lines: &LineIndex, text: &str, diags: &[Diagnostic]) -> Vec<(usize, usize, Color32)> {
+    diags
         .iter()
         .map(|d| {
-            let s = lsp_to_byte(text, d.line, d.col_start);
-            let mut e = lsp_to_byte(text, d.line_end, d.col_end);
+            let s = lines.lsp_to_byte(text, d.line, d.col_start);
+            let mut e = lines.lsp_to_byte(text, d.line_end, d.col_end);
             if e <= s {
                 e = (s + 1).min(text.len());
             }
@@ -1626,14 +1653,18 @@ fn underline_diagnostics(job: &mut LayoutJob, text: &str, diags: &[Diagnostic]) 
             };
             (s, e, color)
         })
-        .collect();
-    apply_ranges(job, &ranges, |fmt, color| fmt.underline = egui::Stroke::new(1.5_f32, color));
+        .collect()
+}
+
+/// Add a coloured underline to every range by splitting sections.
+fn underline_ranges(job: &mut LayoutJob, ranges: &[(usize, usize, Color32)]) {
+    apply_ranges(job, ranges, |fmt, color| fmt.underline = egui::Stroke::new(1.5_f32, color));
 }
 
 /// Background-highlights every find match, with the current one a stronger
 /// colour. Shares the same section-splitting machinery as diagnostics, so
 /// both can land on the same job without one clobbering the other.
-fn highlight_find_matches(job: &mut LayoutJob, text: &str, matches: &[(usize, usize)], current: Option<usize>) {
+fn highlight_find_matches(job: &mut LayoutJob, matches: &[(usize, usize)], current: Option<usize>) {
     if matches.is_empty() {
         return;
     }
@@ -1646,7 +1677,7 @@ fn highlight_find_matches(job: &mut LayoutJob, text: &str, matches: &[(usize, us
             } else {
                 Color32::from_rgba_unmultiplied(0xff, 0xff, 0x00, 70)
             };
-            (char_to_byte(text, *s), char_to_byte(text, *e), color)
+            (*s, *e, color)
         })
         .collect();
     apply_ranges(job, &ranges, |fmt, color| fmt.background = color);
@@ -1769,70 +1800,6 @@ fn disk_changed(old_mtime: Option<SystemTime>, old_size: u64, new_mtime: Option<
 /// each character to its first lowercase char (not full Unicode
 /// case-folding, which can expand one char to several and would break the
 /// 1:1 index mapping this function promises); good enough for source text.
-fn find_matches(text: &str, query: &str, case_insensitive: bool) -> Vec<(usize, usize)> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let norm = |c: char| if case_insensitive { c.to_lowercase().next().unwrap_or(c) } else { c };
-    let hay: Vec<char> = text.chars().map(norm).collect();
-    let needle: Vec<char> = query.chars().map(norm).collect();
-    if needle.len() > hay.len() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    // Skip the whole matched width on a hit rather than advancing by one, so
-    // matches never overlap: `replace_all` splices these ranges in order and
-    // an overlapping pair would double-consume or corrupt the splice.
-    while start + needle.len() <= hay.len() {
-        if hay[start..start + needle.len()] == needle[..] {
-            out.push((start, start + needle.len()));
-            start += needle.len();
-        } else {
-            start += 1;
-        }
-    }
-    out
-}
-
-/// Replaces every match of `query` with `replacement` in one pass. Returns
-/// the new text and how many replacements were made.
-fn replace_all(text: &str, query: &str, replacement: &str, case_insensitive: bool) -> (String, usize) {
-    let matches = find_matches(text, query, case_insensitive);
-    if matches.is_empty() {
-        return (text.to_string(), 0);
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::new();
-    let mut last = 0usize;
-    for (s, e) in &matches {
-        out.extend(chars[last..*s].iter());
-        out.push_str(replacement);
-        last = *e;
-    }
-    out.extend(chars[last..].iter());
-    (out, matches.len())
-}
-
-/// Char index of the start of 1-based `line`, clamped to the end of `text`
-/// if `line` is past the last one.
-fn line_start_char(text: &str, line: usize) -> usize {
-    if line <= 1 {
-        return 0;
-    }
-    let target_newlines = line - 1;
-    let mut seen = 0usize;
-    for (i, c) in text.chars().enumerate() {
-        if c == '\n' {
-            seen += 1;
-            if seen == target_newlines {
-                return i + 1;
-            }
-        }
-    }
-    text.chars().count()
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1924,36 +1891,6 @@ mod tests {
     }
 
     #[test]
-    fn find_matches_is_case_insensitive_by_default_and_non_overlapping() {
-        assert_eq!(find_matches("Foo foo FOO", "foo", true), vec![(0, 3), (4, 7), (8, 11)]);
-        assert_eq!(find_matches("Foo foo FOO", "foo", false), vec![(4, 7)]);
-        assert!(find_matches("abc", "", true).is_empty());
-        assert!(find_matches("ab", "abc", true).is_empty());
-        // "aaa" against "aa": overlapping occurrences are not double-counted.
-        assert_eq!(find_matches("aaa", "aa", true), vec![(0, 2)]);
-    }
-
-    #[test]
-    fn replace_all_counts_and_splices_every_match() {
-        let (out, n) = replace_all("cat cat dog", "cat", "dog", true);
-        assert_eq!(out, "dog dog dog");
-        assert_eq!(n, 2);
-        let (out2, n2) = replace_all("nothing here", "xyz", "q", true);
-        assert_eq!(out2, "nothing here");
-        assert_eq!(n2, 0);
-    }
-
-    #[test]
-    fn line_start_char_finds_each_line() {
-        let text = "aa\nbb\ncc";
-        assert_eq!(line_start_char(text, 1), 0);
-        assert_eq!(line_start_char(text, 2), 3);
-        assert_eq!(line_start_char(text, 3), 6);
-        // Past the last line: clamp to the end rather than panic.
-        assert_eq!(line_start_char(text, 99), text.chars().count());
-    }
-
-    #[test]
     fn apply_text_edits_applies_back_to_front() {
         let mut text = "hello world".to_string();
         // Replace "world" (line 0, col 6..11) and "hello" (col 0..5) in the
@@ -1968,13 +1905,6 @@ mod tests {
         assert_eq!(text, "goodbye there");
     }
 
-    #[test]
-    fn char_to_byte_handles_multibyte_prefix() {
-        let text = "\u{2713}bc"; // U+2713 is 3 bytes in UTF-8
-        assert_eq!(char_to_byte(text, 0), 0);
-        assert_eq!(char_to_byte(text, 1), 3);
-        assert_eq!(char_to_byte(text, 3), text.len());
-    }
 }
 
 /// The text a newline should insert, given everything before the caret.

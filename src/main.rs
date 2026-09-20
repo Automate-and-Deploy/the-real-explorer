@@ -17,6 +17,7 @@ mod hooks_ui;
 mod icons;
 mod lsp;
 mod platform;
+mod textpos;
 mod theme;
 mod titlebar;
 mod trash_ops;
@@ -563,8 +564,15 @@ impl ExplorerApp {
 
     fn open_in_ide(&mut self, path: &Path) {
         let root = self.cwd.clone();
-        self.editor.open(path, &root, &self.cfg.lsp_servers);
-        self.body = Body::Ide;
+        // A refused open (too large, unreadable) leaves the body where it
+        // was; switching to an empty editor made the refusal look like a hang.
+        if self.editor.open(path, &root, &self.cfg.lsp_servers) {
+            self.body = Body::Ide;
+        } else {
+            // The editor wrote its reason to its own status line, which only
+            // the IDE tab shows; repeat it here so the refusal is visible.
+            self.status = self.editor.status.clone();
+        }
     }
 
     fn open_with_system(&mut self, path: &Path) {
