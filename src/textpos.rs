@@ -200,28 +200,6 @@ pub fn replace_all(text: &str, query: &str, replacement: &str, case_insensitive:
     (out, matches.len())
 }
 
-/// First line (zero-based) on which `old` and `new` differ, or `None` when
-/// they are identical. Consumed by the incremental highlighter, which lands
-/// on its own branch; the allow goes when the two merge. Compares bytes from the front, so the cost is the
-/// length of the common prefix plus one line lookup; a keystroke near the
-/// end of a large file still reads the whole prefix, which is one memcmp.
-#[allow(dead_code)]
-pub fn first_changed_line(old: &str, new: &str, new_index: &LineIndex) -> Option<usize> {
-    let a = old.as_bytes();
-    let b = new.as_bytes();
-    let n = a.len().min(b.len());
-    let mut i = 0;
-    while i < n && a[i] == b[i] {
-        i += 1;
-    }
-    if i == a.len() && i == b.len() {
-        return None;
-    }
-    // `i` may sit inside a multi-byte char; the line it belongs to is the
-    // same either way, since a newline is a single byte.
-    Some(new_index.line_of_byte(i))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,13 +293,4 @@ mod tests {
         assert_eq!(n2, 0);
     }
 
-    #[test]
-    fn first_changed_line_finds_the_edit() {
-        let old = "aa\nbb\ncc";
-        let new = "aa\nbX\ncc";
-        assert_eq!(first_changed_line(old, new, &LineIndex::build(new)), Some(1));
-        let appended = "aa\nbb\ncc\ndd";
-        assert_eq!(first_changed_line(old, appended, &LineIndex::build(appended)), Some(2));
-        assert_eq!(first_changed_line(old, old, &LineIndex::build(old)), None);
-    }
 }

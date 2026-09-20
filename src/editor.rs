@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, text::LayoutJob, Color32, Key, Modifiers};
 
+use crate::highlight;
 use crate::lsp::{self, CompletionItem, Diagnostic, LspClient, LspEvent, ServerDef};
 use crate::textpos::{find_matches, replace_all, LineIndex};
 
@@ -71,6 +72,9 @@ pub struct Doc {
     /// The file had a UTF-8 BOM at open; `text` never carries it (parsers
     /// choke on it) but it is written back on save.
     has_bom: bool,
+    /// Incremental syntax highlighting state for this document: per-line style
+    /// runs and parse checkpoints. See `crate::highlight`.
+    hl: highlight::DocHighlight,
 }
 
 impl Doc {
@@ -233,6 +237,9 @@ impl Editor {
             disk_conflict: false,
             read_only,
             has_bom,
+            // The grammar is resolved once, here, rather than looked up by
+            // extension on every frame the way the old layouter did.
+            hl: highlight::DocHighlight::new(&ext),
         };
         // A lossy read cannot safely round-trip through a language server
         // either (it would be editing bytes that do not exist in the file),
@@ -338,9 +345,11 @@ impl Editor {
         let mut out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
         out.push('\n');
         if out != d.text {
+            let line = highlight::first_changed_line(&d.text, &out);
             d.text = out.clone();
             d.text_replaced();
             d.last_text = out;
+            d.hl.note_edit(line);
             d.dirty = true;
             d.version += 1;
             let (path, version, text) = (d.path.clone(), d.version, d.text.clone());
@@ -479,6 +488,7 @@ impl Editor {
                     d.text = text.clone();
                     d.text_replaced();
                     d.last_text = text;
+                    d.hl.reset();
                     d.has_bom = has_bom;
                     d.read_only = read_only;
                     d.version += 1;
@@ -525,6 +535,7 @@ impl Editor {
                     d.text = text.clone();
                     d.text_replaced();
                     d.last_text = text.clone();
+                    d.hl.reset();
                     d.has_bom = has_bom;
                     d.read_only = read_only;
                     d.dirty = false;
@@ -602,8 +613,10 @@ impl Editor {
                                 } else if d.read_only {
                                     self.status = "Format reply arrived but the file is read-only; discarded".into();
                                 } else {
+                                    let before = std::mem::take(&mut d.last_text);
                                     apply_text_edits(&mut d.text, &edits);
                                     d.text_replaced();
+                                    d.hl.note_edit(highlight::first_changed_line(&before, &d.text));
                                     d.last_text = d.text.clone();
                                     d.dirty = true;
                                     d.version += 1;
@@ -655,15 +668,17 @@ impl Editor {
         }
         let at_c = self.cursor_char.min(d.lines.char_count());
         let at = d.lines.char_to_byte(&d.text, at_c);
+        let line = d.lines.line_of_char(at_c);
         // `newline_indent` only looks back to the start of the current line,
         // so handing it that line's prefix gives the same answer as the whole
         // text did, without copying the whole text.
-        let line0 = d.lines.line_byte_start(d.lines.line_of_char(at_c));
+        let line0 = d.lines.line_byte_start(line);
         let line_prefix: Vec<char> = d.text[line0..at].chars().collect();
         let insert = newline_indent(&line_prefix);
         d.text.insert_str(at, &insert);
         let cursor = at_c + insert.chars().count();
         d.text_replaced();
+        d.hl.note_edit(line);
         let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
         state
             .cursor
@@ -686,9 +701,11 @@ impl Editor {
         }
         let sb = d.lines.char_to_byte(&d.text, start);
         let eb = d.lines.char_to_byte(&d.text, end);
+        let line = d.lines.line_of_char(start);
         d.text.replace_range(sb..eb, &item.insert_text);
         let new_cursor = start + item.insert_text.chars().count();
         d.text_replaced();
+        d.hl.note_edit(line);
         // Move the widget's cursor to the end of the inserted text.
         let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
         state
@@ -748,8 +765,10 @@ impl Editor {
         }
         let matches = find_matches(&d.text, &query, ci);
         let Some(&(s, e)) = matches.get(current) else { return };
+        let line = d.lines.line_of_byte(s);
         d.text.replace_range(s..e, &replacement);
         d.text_replaced();
+        d.hl.note_edit(line);
         d.last_text = d.text.clone();
         d.dirty = true;
         d.version += 1;
@@ -782,6 +801,7 @@ impl Editor {
             self.status = "No matches".into();
             return;
         }
+        d.hl.note_edit(highlight::first_changed_line(&d.text, &new_text));
         d.text = new_text;
         d.text_replaced();
         d.last_text = d.text.clone();
@@ -1065,12 +1085,11 @@ impl Editor {
                 PreviewKind::None => {}
             }
             ui.checkbox(&mut self.word_wrap, "Wrap");
-            if self.docs[active].text.len() > HIGHLIGHT_MAX_BYTES {
-                ui.colored_label(Color32::from_rgb(0xe0, 0xaf, 0x68), "Syntax colouring off (large file)")
-                    .on_hover_text(format!(
-                        "Highlighting costs about a second per 250 KB and reruns on every edit, so it is skipped above {} KiB.",
-                        HIGHLIGHT_MAX_BYTES / 1024
-                    ));
+            // A large file is no longer refused colour, it is coloured in
+            // the background; say how far along that is and nothing else.
+            if let Some(done) = self.docs[active].hl.progress() {
+                ui.small(egui::RichText::new(format!("colouring {:.0}%", done * 100.0)).weak())
+                    .on_hover_text("The first pass over a large file runs on a background thread; lines it has not reached yet are shown plain.");
             }
             if self.docs[active].read_only {
                 ui.colored_label(Color32::from_rgb(0xe0, 0xaf, 0x68), "Read-only (not valid UTF-8)");
@@ -1214,8 +1233,6 @@ impl Editor {
         self.show_goto_bar(ui, &ctx, edit_id, active);
 
         // ---- editor body ----
-        let lang = self.docs[active].path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(&ctx, ui.style());
         let diag_ranges = {
             let d = &self.docs[active];
             diagnostic_ranges(&d.lines, &d.text, &d.diagnostics)
@@ -1223,18 +1240,24 @@ impl Editor {
         let find_matches_now: Vec<(usize, usize)> =
             self.find.as_ref().map(|f| find_matches(&self.docs[active].text, &f.query, f.case_insensitive)).unwrap_or_default();
         let find_current = self.find.as_ref().map(|f| f.current);
-        let highlighting = self.docs[active].text.len() <= HIGHLIGHT_MAX_BYTES;
-        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            let mut job = if highlighting {
-                egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, text, &lang)
-            } else {
-                plain_job(ui, text)
-            };
-            underline_ranges(&mut job, &diag_ranges);
-            highlight_find_matches(&mut job, &find_matches_now, find_current);
-            job.wrap.max_width = wrap_width;
-            ui.fonts(|f| f.layout_job(job))
-        };
+        // The highlighter is moved out of the document for the duration of
+        // the editor body: the layouter closure needs it while `TextEdit` holds
+        // `d.text` mutably, and two disjoint borrows of one `Doc` reached
+        // through an index are not something the borrow checker can see. It
+        // goes back below, once the closure has been dropped.
+        let mut hl = std::mem::take(&mut self.docs[active].hl);
+        hl.set_dark(ui.visuals().dark_mode);
+        let hl_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let hl_plain = ui.visuals().text_color();
+        // Re-parse from the dirty watermark within a per-frame budget. Work
+        // left over means the document is not fully coloured yet, so ask for
+        // another frame rather than stalling this one.
+        if hl.advance(&self.docs[active].text, highlight::Budget::frame()) {
+            ctx.request_repaint();
+        }
+        // First line the widget changed this frame, handed to the highlighter
+        // below once the layouter's borrow of it has ended.
+        let mut edit_first_line: Option<usize> = None;
 
         let diag_h = if self.docs[active].diagnostics.is_empty() { 0.0 } else { 90.0 };
         let available_height = (ui.available_height() - diag_h).max(0.0);
@@ -1249,6 +1272,17 @@ impl Editor {
         let mut galley_pos = egui::Pos2::ZERO;
         let mut cursor_pos: Option<egui::Pos2> = None;
         let mut text_changed = false;
+
+        {
+        let hl_ref = &hl;
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            // `None` asks for the whole document: today's `TextEdit` lays out
+            // every line. A virtualised view passes the visible line range.
+            let mut job = hl_ref.layout_job(text, hl_font.clone(), hl_plain, None, wrap_width);
+            underline_ranges(&mut job, &diag_ranges);
+            highlight_find_matches(&mut job, &find_matches_now, find_current);
+            ui.fonts(|f| f.layout_job(job))
+        };
 
         egui::ScrollArea::vertical()
             .id_salt(("editor-vscroll", active))
@@ -1287,6 +1321,9 @@ impl Editor {
                             d.dirty = true;
                             d.version += 1;
                             d.text_replaced();
+                            // The widget reports no splice, so the first
+                            // changed line comes from the common prefix.
+                            edit_first_line = Some(highlight::first_changed_line(&d.last_text, &d.text));
                             d.last_text = d.text.clone();
                         }
                         if let Some(idx) = self.pending_scroll_to.take() {
@@ -1335,6 +1372,8 @@ impl Editor {
                                 d.dirty = true;
                                 d.version += 1;
                                 d.text_replaced();
+                                // Same as the wrapped branch above.
+                                edit_first_line = Some(highlight::first_changed_line(&d.last_text, &d.text));
                                 d.last_text = d.text.clone();
                             }
                             if let Some(idx) = self.pending_scroll_to.take() {
@@ -1360,6 +1399,14 @@ impl Editor {
                     }
                 });
             });
+        }
+
+        if let Some(line) = edit_first_line {
+            hl.note_edit(line);
+        }
+        if let Some(d) = self.docs.get_mut(active) {
+            d.hl = hl;
+        }
 
         // Built-in JSON check for documents with no language server.
         if (text_changed || self.docs[active].version == 0) && self.docs[active].server.is_none() && is_json(&self.docs[active].path) {
@@ -1616,23 +1663,6 @@ fn apply_text_edits(text: &mut String, edits: &[lsp::TextEdit]) {
         }
         text.replace_range(s..end, &e.new_text);
     }
-}
-
-/// Largest document that still gets syntax colouring.
-///
-/// Measured on this tree with `examples/hlbench.rs`: syntect runs at roughly
-/// 240 KB/s in a release build, and egui memoises the result per text value,
-/// so the whole file is re-highlighted on every keystroke. At 64 KiB that is
-/// about a quarter second, which is already the limit of tolerable; a 1 MB
-/// file took five seconds, which is what prompted the cap. Plain layout of the
-/// same text is 20-40x cheaper, so oversized files stay usable without colour.
-const HIGHLIGHT_MAX_BYTES: usize = 64 * 1024;
-
-/// Uncoloured monospace layout, used in place of syntect on large files.
-fn plain_job(ui: &egui::Ui, text: &str) -> LayoutJob {
-    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-    let color = ui.visuals().text_color();
-    LayoutJob::simple(text.to_owned(), font_id, color, f32::INFINITY)
 }
 
 /// Diagnostic spans as byte ranges with their severity colour. Computed once

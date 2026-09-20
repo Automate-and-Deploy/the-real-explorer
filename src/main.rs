@@ -12,6 +12,7 @@ mod config;
 mod editor;
 mod harness;
 mod harness_ui;
+mod highlight;
 mod hooks;
 mod hooks_ui;
 mod icons;
