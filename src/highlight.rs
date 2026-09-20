@@ -253,6 +253,7 @@ impl Budget {
     }
 
     /// No limit: run to convergence or to the end of the document.
+    #[allow(dead_code)]
     pub fn unlimited() -> Self {
         Self { lines: usize::MAX, time: None }
     }
@@ -273,8 +274,10 @@ impl Budget {
 struct LineEntry {
     /// Style runs as `(byte length, interned style id)`, summing to the line's
     /// byte length including its newline. `None` once trimmed out of the
-    /// section window, or never computed.
-    runs: Option<Vec<(u32, u16)>>,
+    /// section window, or never computed. Boxed rather than a `Vec` because a
+    /// `Vec` header costs 8 bytes more per line, which is 1.5 MB at 190 k
+    /// lines for a capacity field nothing ever uses.
+    runs: Option<Box<[(u32, u16)]>>,
     /// Parser and highlighter state *after* this line, kept every K lines.
     /// This is what convergence is tested against.
     state: Option<Box<(ParseState, HighlightState)>>,
@@ -338,6 +341,12 @@ pub struct DocHighlight {
     /// Line range most recently asked of `layout_job`, which anchors the
     /// section window. `Cell` because `layout_job` takes `&self`.
     last_range: Cell<Option<(usize, usize)>>,
+    /// Sections the previous job needed, so the next one allocates once
+    /// instead of doubling its way up to eight megabytes.
+    section_hint: Cell<usize>,
+    /// Window `trim_sections` last enforced. Trimming walks every line, so
+    /// repeating it for an unchanged window would cost more than it saves.
+    trimmed_to: Option<(usize, usize)>,
 
     bg: Option<Receiver<BgBatch>>,
     /// True once a background pass has been started for the current text, so a
@@ -350,6 +359,10 @@ pub struct DocHighlight {
     bg_valid_below: usize,
     /// Total lines in the background snapshot, for progress reporting.
     bg_total: usize,
+    /// Size at which the first pass goes off-thread. A field rather than the
+    /// constant directly so tests can exercise the channel path without
+    /// parsing a quarter of a megabyte.
+    bg_min_bytes: usize,
 }
 
 impl Default for DocHighlight {
@@ -377,12 +390,23 @@ impl DocHighlight {
             stride: 1,
             last_advance_lines: 0,
             last_range: Cell::new(None),
+            section_hint: Cell::new(0),
+            trimmed_to: None,
             bg: None,
             bg_started: false,
             bg_remap: Vec::new(),
             bg_valid_below: usize::MAX,
             bg_total: 0,
+            bg_min_bytes: BACKGROUND_MIN_BYTES,
         }
+    }
+
+    /// Send even a small document's first pass to a background thread, so the
+    /// channel, the style remap and the mid-pass edit rule can be tested
+    /// without a 256 KiB fixture.
+    #[cfg(test)]
+    fn always_background(&mut self) {
+        self.bg_min_bytes = 0;
     }
 
     /// True when no grammar matched and every job is laid out plain.
@@ -403,6 +427,7 @@ impl DocHighlight {
         self.hl_to = 0;
         self.cursor = None;
         self.last_advance_lines = 0;
+        self.trimmed_to = None;
         // Drop the receiver: the worker's next `send` fails and it exits.
         self.bg = None;
         self.bg_started = false;
@@ -496,6 +521,13 @@ impl DocHighlight {
         self.line_starts.len()
     }
 
+    /// Leading lines that currently have valid colour. Everything from here
+    /// down is emitted plain until `advance` reaches it.
+    #[allow(dead_code)]
+    pub fn highlighted_lines(&self) -> usize {
+        self.hl_to
+    }
+
     // -- internals ---------------------------------------------------------
 
     fn theme(&self) -> &'static Theme {
@@ -531,6 +563,9 @@ impl DocHighlight {
             }
         }
         self.lines.resize_with(new_lines, LineEntry::default);
+        if new_lines != old_lines {
+            self.trimmed_to = None;
+        }
         self.hl_to = self.hl_to.min(new_lines);
         self.stride = Self::stride_for(new_lines);
         // The edited line itself is never valid until re-walked.
@@ -564,7 +599,10 @@ impl DocHighlight {
 
         let total = self.line_starts.len();
         if self.hl_to >= total {
-            return self.bg.is_some();
+            // The foreground caught up (or converged): whatever the background
+            // pass still has to say is already known, so stop paying for it.
+            self.bg = None;
+            return false;
         }
 
         let ps = assets().syntaxes.clone();
@@ -630,7 +668,7 @@ impl DocHighlight {
                     _ => runs.push((piece.len() as u32, id)),
                 }
             }
-            self.lines[line].runs = Some(runs);
+            self.lines[line].runs = Some(runs.into_boxed_slice());
             walked += 1;
 
             // Convergence: if the state after this line is what was already
@@ -668,7 +706,7 @@ impl DocHighlight {
     /// Start the initial pass off-thread for a large document. The UI never
     /// blocks on it: results arrive through a channel that `advance` drains.
     fn maybe_start_background(&mut self, text: &str) {
-        if self.bg_started || self.bg.is_some() || text.len() < BACKGROUND_MIN_BYTES {
+        if self.bg_started || self.bg.is_some() || text.len() < self.bg_min_bytes {
             return;
         }
         let Some(name) = self.syntax.clone() else { return };
@@ -719,7 +757,7 @@ impl DocHighlight {
                         if idx >= self.bg_valid_below || idx >= self.lines.len() {
                             break;
                         }
-                        let mapped = runs
+                        let mapped: Box<[(u32, u16)]> = runs
                             .into_iter()
                             .map(|(len, id)| {
                                 (len, self.bg_remap.get(id as usize).copied().unwrap_or(0))
@@ -765,6 +803,10 @@ impl DocHighlight {
         if keep_lo == 0 && keep_hi >= self.lines.len() {
             return;
         }
+        if self.trimmed_to == Some((keep_lo, keep_hi)) {
+            return;
+        }
+        self.trimmed_to = Some((keep_lo, keep_hi));
         for (i, entry) in self.lines.iter_mut().enumerate() {
             if i < keep_lo || i >= keep_hi {
                 entry.runs = None;
@@ -813,6 +855,7 @@ impl DocHighlight {
 
         let mut job = LayoutJob {
             text: slice.to_owned(),
+            sections: Vec::with_capacity(self.section_hint.get()),
             ..Default::default()
         };
         job.wrap.max_width = wrap_width;
@@ -869,6 +912,7 @@ impl DocHighlight {
         if job.sections.is_empty() && !slice.is_empty() {
             push_plain(&mut job, 0, slice.len(), &plain_fmt);
         }
+        self.section_hint.set(job.sections.len());
         job
     }
 }
@@ -1371,6 +1415,62 @@ mod tests {
         while hl.advance(&b, Budget::unlimited()) {}
         let inc = hl.layout_job(&b, font(), Color32::GRAY, None, f32::INFINITY);
         assert_eq!(fingerprint(&inc), fingerprint(&full("rs", &b)));
+    }
+
+    #[test]
+    fn the_background_pass_delivers_the_same_colours() {
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("/// doc {i}
+pub fn g{i}() -> &'static str {{ \"s{i}\" }}
+"));
+        }
+        let mut hl = DocHighlight::new("rs");
+        hl.always_background();
+        // A one-line budget keeps the foreground out of the way, so most of the
+        // colour can only have come off the thread.
+        let mut spins = 0;
+        let mut saw_pass = false;
+        while hl.advance(&text, Budget::lines(1)) {
+            saw_pass |= hl.progress().is_some();
+            spins += 1;
+            assert!(spins < 200_000, "background pass never finished");
+        }
+        assert!(saw_pass, "no background pass ever ran");
+        assert!(hl.highlighted_lines() >= 1200);
+        assert_eq!(
+            fingerprint(&hl.layout_job(&text, font(), Color32::GRAY, None, f32::INFINITY)),
+            fingerprint(&full("rs", &text))
+        );
+    }
+
+    #[test]
+    fn an_edit_during_the_background_pass_discards_the_racing_lines() {
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("pub const K{i}: u32 = {i}; // note {i}
+"));
+        }
+        let mut hl = DocHighlight::new("rs");
+        hl.always_background();
+        // Let the pass get going, then open a block comment at line 5: every
+        // line from there on must be re-derived, not taken from the snapshot.
+        hl.advance(&text, Budget::lines(1));
+        let edited = insert_line(&text, 5, "/* opened here
+");
+        let line = first_changed_line(&text, &edited);
+        assert_eq!(line, 5);
+        text = edited;
+        hl.note_edit(line);
+        let mut spins = 0;
+        while hl.advance(&text, Budget::lines(64)) {
+            spins += 1;
+            assert!(spins < 200_000, "never settled after the racing edit");
+        }
+        assert_eq!(
+            fingerprint(&hl.layout_job(&text, font(), Color32::GRAY, None, f32::INFINITY)),
+            fingerprint(&full("rs", &text))
+        );
     }
 
     #[test]
