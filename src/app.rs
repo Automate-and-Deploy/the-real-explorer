@@ -2131,11 +2131,12 @@ impl ExplorerApp {
             return;
         }
         let id = egui::ViewportId::from_hash_of("settings-window");
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Settings")
-            .with_inner_size([640.0, 720.0])
-            .with_min_inner_size([460.0, 400.0])
-            .with_decorations(false);
+        let builder = titlebar::child_chrome(
+            egui::ViewportBuilder::default()
+                .with_title("Settings")
+                .with_inner_size([640.0, 720.0])
+                .with_min_inner_size([460.0, 400.0]),
+        );
         ctx.show_viewport_immediate(id, builder, |ctx, class| {
             if class == egui::ViewportClass::Embedded {
                 let mut open = true;
@@ -2152,7 +2153,9 @@ impl ExplorerApp {
                 });
             });
             titlebar::resize_handles(ctx);
-            if ctx.input(|i| i.viewport().close_requested()) {
+            // Escape closes as well as the window button: a child window with
+            // no keyboard way out is a trap on any platform whose chrome fails.
+            if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 self.settings_open = false;
             }
         });

@@ -89,11 +89,12 @@ impl HarnessWindow {
             actions.push(Action::Refresh);
         }
         let id = egui::ViewportId::from_hash_of("harness-window");
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Agents, skills and hooks")
-            .with_inner_size([960.0, 620.0])
-            .with_min_inner_size([640.0, 400.0])
-            .with_decorations(false);
+        let builder = crate::titlebar::child_chrome(
+            egui::ViewportBuilder::default()
+                .with_title("Agents, skills and hooks")
+                .with_inner_size([960.0, 620.0])
+                .with_min_inner_size([640.0, 400.0]),
+        );
         ctx.show_viewport_immediate(id, builder, |ctx, class| {
             if class == egui::ViewportClass::Embedded {
                 // Backend cannot open native windows; fall back to an in-app window.
@@ -103,7 +104,9 @@ impl HarnessWindow {
             crate::titlebar::show(ctx, "Agents, skills and hooks");
             egui::CentralPanel::default().show(ctx, |ui| self.body(ui, project, &mut actions));
             crate::titlebar::resize_handles(ctx);
-            if ctx.input(|i| i.viewport().close_requested()) {
+            // Escape closes as well as the window button; edits in the hooks
+            // tab live in this struct and survive a close.
+            if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 self.open = false;
             }
         });

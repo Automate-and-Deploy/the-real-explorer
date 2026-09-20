@@ -20,6 +20,24 @@ use crate::icons;
 const BAR_HEIGHT: f32 = 30.0;
 const EDGE: f32 = 6.0;
 
+/// Window chrome for a child viewport, the same per-platform choice the main
+/// window makes. macOS keeps its real title bar so the traffic lights exist;
+/// the strip drawn by `show` skips its own buttons there. Everywhere else the
+/// window is undecorated and the strip supplies the buttons. Before this
+/// helper the Settings and Agents windows switched decorations off
+/// unconditionally, which on macOS left them with no close, minimise or zoom
+/// at all.
+pub fn child_chrome(b: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    #[cfg(target_os = "macos")]
+    {
+        b.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        b.with_decorations(false)
+    }
+}
+
 /// Draw the title strip as a top panel. Call before other panels.
 pub fn show(ctx: &egui::Context, title: &str) {
     egui::TopBottomPanel::top("titlebar")
