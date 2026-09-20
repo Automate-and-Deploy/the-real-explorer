@@ -610,6 +610,29 @@ impl Editor {
         self.pending_completion = Some(id);
     }
 
+    /// Insert a newline that keeps the current line's leading whitespace, and
+    /// one more level after a line that ends in an opening bracket.
+    fn insert_newline_with_indent(&mut self, ctx: &egui::Context, edit_id: egui::Id) {
+        let Some(d) = self.docs.get_mut(self.active) else { return };
+        if d.read_only {
+            return;
+        }
+        let chars: Vec<char> = d.text.chars().collect();
+        let at = self.cursor_char.min(chars.len());
+        let insert = newline_indent(&chars[..at]);
+        let mut next: String = chars[..at].iter().collect();
+        next.push_str(&insert);
+        let cursor = next.chars().count();
+        next.extend(chars[at..].iter());
+        d.text = next;
+        let mut state = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(cursor))));
+        egui::TextEdit::store_state(ctx, edit_id, state);
+        self.cursor_char = cursor;
+    }
+
     fn accept_completion(&mut self, ctx: &egui::Context, edit_id: egui::Id) {
         let Some(comp) = self.completion.take() else { return };
         let Some(item) = comp.items.get(comp.selected) else { return };
@@ -1026,6 +1049,8 @@ impl Editor {
         }
 
         // ---- keys the popup / find / goto own, consumed before the widget sees them ----
+        let mut newline = false;
+        let editor_focused = ctx.memory(|m| m.has_focus(ui.make_persistent_id(("editor", self.active))));
         let mut accept = false;
         let mut ctrl_space = false;
         let mut save = false;
@@ -1087,9 +1112,20 @@ impl Editor {
             if i.consume_key(Modifiers::COMMAND, Key::G) {
                 toggle_goto = true;
             }
+            // Auto-indent. egui inserts a bare newline and carries its own TODO
+            // about this (`text_edit/builder.rs`, the Enter handler), so there
+            // is no builder flag to turn on: the newline has to be written here
+            // before the widget sees the key. Only when the text area itself
+            // has focus, so Enter in the find bar or a dialog is untouched.
+            if editor_focused && i.consume_key(Modifiers::NONE, Key::Enter) {
+                newline = true;
+            }
         });
 
         let edit_id = ui.make_persistent_id(("editor", active));
+        if newline {
+            self.insert_newline_with_indent(&ctx, edit_id);
+        }
         if accept {
             self.accept_completion(&ctx, edit_id);
         }
@@ -1770,6 +1806,30 @@ fn line_start_char(text: &str, line: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn newline_indent_matches_the_current_line() {
+        let text: Vec<char> = "fn a() {\n    let x = 1;".chars().collect();
+        assert_eq!(newline_indent(&text), "\n    ");
+    }
+
+    #[test]
+    fn newline_indent_adds_a_level_after_an_opening_brace() {
+        let text: Vec<char> = "    fn a() {".chars().collect();
+        assert_eq!(newline_indent(&text), "\n        ");
+    }
+
+    #[test]
+    fn newline_indent_keeps_tabs_when_the_file_uses_tabs() {
+        let text: Vec<char> = "\tif x {".chars().collect();
+        assert_eq!(newline_indent(&text), "\n\t\t");
+    }
+
+    #[test]
+    fn newline_indent_on_an_empty_first_line_is_a_bare_newline() {
+        assert_eq!(newline_indent(&[]), "\n");
+    }
+
     use super::*;
 
     #[test]
@@ -1886,6 +1946,34 @@ mod tests {
         assert_eq!(char_to_byte(text, 1), 3);
         assert_eq!(char_to_byte(text, 3), text.len());
     }
+}
+
+/// The text a newline should insert, given everything before the caret.
+///
+/// Matches the current line's leading whitespace, and adds one more level
+/// after a line whose last non-space character opens a block. The extra level
+/// copies the indent character already in use so a tab file stays tabs and a
+/// space file stays spaces, since there is no width setting to consult.
+fn newline_indent(before: &[char]) -> String {
+    let line_start = before.iter().rposition(|c| *c == '\n').map(|i| i + 1).unwrap_or(0);
+    let line = &before[line_start..];
+    let indent: String = line.iter().take_while(|c| **c == ' ' || **c == '\t').collect();
+    let opens = line
+        .iter()
+        .rev()
+        .find(|c| !c.is_whitespace())
+        .map(|c| matches!(c, '{' | '[' | '(' | ':'))
+        .unwrap_or(false);
+    let mut out = String::from("\n");
+    out.push_str(&indent);
+    if opens {
+        if indent.contains('\t') {
+            out.push('\t');
+        } else {
+            out.push_str("    ");
+        }
+    }
+    out
 }
 
 /// What the Preview control offers for a given file.
