@@ -760,8 +760,10 @@ impl ExplorerApp {
             };
             let mut dst = self.cwd.join(name);
             // Pasting into the source folder is a duplicate, not a collision.
+            let mut duplicate = false;
             if dst == src {
                 dst = unique_name(&dst);
+                duplicate = true;
             } else if dst.exists() {
                 match policy {
                     Collision::Ask => {
@@ -794,6 +796,9 @@ impl ExplorerApp {
                 self.status = format!("Paste failed: {e}");
                 self.refresh_all();
                 return;
+            }
+            if duplicate {
+                self.meta_copy(&src, &dst);
             }
             done += 1;
         }
@@ -942,9 +947,15 @@ impl ExplorerApp {
 
     fn undo(&mut self) {
         let r = match self.undo.take() {
-            Some(Undo::Rename(cur, prev)) => fs::rename(&cur, &prev)
-                .map(|()| format!("Restored {}", prev.display()))
-                .map_err(|e| e.to_string()),
+            Some(Undo::Rename(cur, prev)) => match fs::rename(&cur, &prev) {
+                Ok(()) => {
+                    // Undoing a rename is a rename, and the note follows it
+                    // back the same way it followed it out.
+                    self.meta_rename(&cur, &prev);
+                    Ok(format!("Restored {}", prev.display()))
+                }
+                Err(e) => Err(e.to_string()),
+            },
             Some(Undo::Delete(orig)) => match trash_ops::restore(&orig) {
                 Ok(true) => Ok(format!("Restored {}", orig.display())),
                 Ok(false) => Err(format!("{} not found in {}", orig.display(), trash_ops::bin_name())),
@@ -1063,6 +1074,73 @@ impl ExplorerApp {
         Ok(true)
     }
 
+    /// Move an entry's note with the file after a rename in place.
+    ///
+    /// A rename that lands in a different folder is a move, and a note stays
+    /// in the folder that holds it, so nothing is carried across.
+    fn meta_rename(&mut self, from: &Path, to: &Path) {
+        let (Some(dir), Some(old), Some(new)) = (from.parent(), from.file_name(), to.file_name()) else {
+            return;
+        };
+        if to.parent() != Some(dir) {
+            return;
+        }
+        let (dir, old, new) = (
+            dir.to_path_buf(),
+            old.to_string_lossy().into_owned(),
+            new.to_string_lossy().into_owned(),
+        );
+        if let Err(e) = self.edit_meta(&dir, false, |m| m.rename_entry(&old, &new)) {
+            self.status = format!("Renamed, but the note did not follow: {e}");
+        }
+    }
+
+    /// Give a duplicate the original's note, after a paste into the folder the
+    /// item already lives in.
+    fn meta_copy(&mut self, from: &Path, to: &Path) {
+        let (Some(dir), Some(old), Some(new)) = (from.parent(), from.file_name(), to.file_name()) else {
+            return;
+        };
+        if to.parent() != Some(dir) {
+            return;
+        }
+        let (dir, old, new) = (
+            dir.to_path_buf(),
+            old.to_string_lossy().into_owned(),
+            new.to_string_lossy().into_owned(),
+        );
+        if let Err(e) = self.edit_meta(&dir, false, |m| m.copy_entry(&old, &new)) {
+            self.status = format!("Copied, but the note did not: {e}");
+        }
+    }
+
+    /// Drop the entries for items that have gone to the recycle bin, so a
+    /// sidecar does not grow for ever and a restore does not resurrect a note
+    /// onto whatever now has that name.
+    fn meta_removed(&mut self, paths: &[PathBuf]) {
+        let mut by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for p in paths {
+            if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
+                by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .push(name.to_string_lossy().into_owned());
+            }
+        }
+        for (dir, names) in by_dir {
+            let r = self.edit_meta(&dir, false, |m| {
+                let mut changed = false;
+                for n in &names {
+                    changed |= m.remove_entry(n);
+                }
+                changed
+            });
+            if let Err(e) = r {
+                self.status = format!("Deleted, but the notes file was not updated: {e}");
+            }
+        }
+    }
+
     /// Write the Properties window's note and tags into the sidecar.
     ///
     /// A failure leaves the typed text exactly where it is: the window stays
@@ -1122,14 +1200,20 @@ impl ExplorerApp {
                 if dst != path && dst.exists() {
                     Err(format!("{} already exists", dst.display()))
                 } else {
-                    fs::rename(&path, &dst).map_err(|e| e.to_string()).map(|()| {
-                        self.undo = Some(Undo::Rename(dst, path));
-                    })
+                    match fs::rename(&path, &dst) {
+                        Ok(()) => {
+                            self.meta_rename(&path, &dst);
+                            self.undo = Some(Undo::Rename(dst, path));
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
             }
             Modal::Delete { paths } => {
                 let n = paths.len();
                 trash_ops::delete_many_to_trash(&paths).map(|()| {
+                    self.meta_removed(&paths);
                     // Undo restores the first one; the bin holds the rest.
                     if let Some(first) = paths.into_iter().next() {
                         self.undo = Some(Undo::Delete(first));
